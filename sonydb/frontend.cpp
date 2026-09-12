@@ -162,7 +162,7 @@ static const char* get_genre(const char* src)
 
 static void print_song(Song* song)
 {
-	printf("songs(%04d): %s,%s,%s\n\tencoding=%s\n\tfilename=%s\n\tgenre=%s\n\tsonglen=%d\n\ttrack_nr=%d\n\tyear=%d\n",
+	printf("songs(%04d): %s,%s,%s\n\tencoding=%u\n\tfilename=%s\n\tgenre=%s\n\tsonglen=%d\n\ttrack_nr=%d\n\tyear=%d\n",
 			song->sonyDbOrder,
 			song->artist,
 			song->album,
@@ -907,7 +907,7 @@ int main(int argc, char* argv[])
 		songs = sonydb.getSongs();
 		for(itsongs = songs.begin(); itsongs != songs.end(); itsongs++) {
 			if ((*itsongs)->sonyDbOrder == atol(argv[2])) {
-				printf("songs(%04d): %s,%s,%s\n\tencoding=%s\n\tfilename=%s\n\tgenre=%s\n\tsonglen=%d\n\ttrack_nr=%d\n\tyear=%d\n",
+				printf("songs(%04d): %s,%s,%s\n\tencoding=%u\n\tfilename=%s\n\tgenre=%s\n\tsonglen=%d\n\ttrack_nr=%d\n\tyear=%d\n",
 						(*itsongs)->sonyDbOrder,
 						(*itsongs)->artist,
 						(*itsongs)->album,
@@ -1035,7 +1035,7 @@ int main(int argc, char* argv[])
 		song->wGenre = 0; //(utf16char*)wcsdup(string2wstring(song->genre).c_str());
 		song->wTitle = 0; //(utf16char*)wcsdup(tag.getTitle());
 		song->statusOfSong = ADD_TO_DEVICE;
-		printf("songs(%04d): %s,%s,%s\n\tencoding=%s\n\tfilename=%s\n\tgenre=%s\n\tsonglen=%d\n\ttrack_nr=%d\n\tyear=%d\n",
+		printf("songs(%04d): %s,%s,%s\n\tencoding=%u\n\tfilename=%s\n\tgenre=%s\n\tsonglen=%d\n\ttrack_nr=%d\n\tyear=%d\n",
 				song->sonyDbOrder,
 				song->artist,
 				song->album,
@@ -1163,7 +1163,7 @@ int main(int argc, char* argv[])
 		for(itsongs = songs.begin(); itsongs != songs.end(); itsongs++) {
 			struct stat statbuf = {0};
 			if (stat((*itsongs)->filename, &statbuf) == -1) {
-				printf("deleted link of ", (*itsongs)->filename);
+				printf("deleted link of %s\n", (*itsongs)->filename);
 				sonydb.delSong(*itsongs);
 			}
 			deleteSongPtr(*itsongs);
@@ -1192,4 +1192,3 @@ int main(int argc, char* argv[])
 #endif
 	return 0;
 }
-

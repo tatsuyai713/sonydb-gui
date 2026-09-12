@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SonyDb GUI
+Comment=Transfer music to legacy Sony Walkman players
+Exec=sonydb-gui
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Audio;Utility;

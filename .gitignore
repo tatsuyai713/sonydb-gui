@@ -1,0 +1,62 @@
+# CMake out-of-source builds
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+install_manifest.txt
+
+# Compiler and linker output
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.d
+*.gcda
+*.gcno
+*.gcov
+*.sonydb-part
+
+# Qt generated files
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.qmlc
+*.jsc
+
+# Locally built executables
+sonydb-gui
+sonydb/sonydb
+sonydb/sonydb-cli
+sonydb/sonydb-core-test
+
+# Autotools generated files from the original sonydb build
+sonydb/.deps/
+sonydb/autom4te.cache/
+sonydb/aclocal.m4
+sonydb/config.h
+sonydb/config.log
+sonydb/config.status
+sonydb/configure
+sonydb/Makefile
+sonydb/stamp-h*
+sonydb/sonydb.spec
+
+# IDE and editor state
+.vscode/
+.idea/
+*.user
+*.user.*
+*.swp
+*.swo
+*~
+
+# Desktop and OS metadata
+.DS_Store
+Thumbs.db
+
+# Local CMake presets may contain machine-specific paths
+CMakeUserPresets.json

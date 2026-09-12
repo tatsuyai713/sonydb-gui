@@ -20,6 +20,7 @@
 #endif
 #endif
 #include <stdio.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -28,41 +29,33 @@
 
 using namespace std;
 
-#ifndef _ID3LIB_ID3_H_
-typedef short 		      int16;
-typedef int 		      int32;
-//typedef long long 	      int64;
-typedef char 		      int8;
-typedef unsigned short 	      uint16;
-typedef unsigned int 	      uint32;
-//typedef unsigned long long    uint64;
-typedef unsigned char 	      uint8;
-#endif
 #if !defined(_WIN32) && !defined(__MINGW32__)
 typedef long long __int64;
 #endif
-typedef unsigned short       utf16char;
+typedef std::uint16_t utf16char;
 
-#define UINT32_SWAP_BE_LE(val) ((uint32) ( \
-(((uint32) (val) & (uint32) 0x000000ffU) << 24) | \
-(((uint32) (val) & (uint32) 0x0000ff00U) <<  8) | \
-(((uint32) (val) & (uint32) 0x00ff0000U) >>  8) | \
-(((uint32) (val) & (uint32) 0xff000000U) >> 24)))
+#define UINT32_SWAP_BE_LE(val) ((std::uint32_t) ( \
+(((std::uint32_t) (val) & (std::uint32_t) 0x000000ffU) << 24) | \
+(((std::uint32_t) (val) & (std::uint32_t) 0x0000ff00U) <<  8) | \
+(((std::uint32_t) (val) & (std::uint32_t) 0x00ff0000U) >>  8) | \
+(((std::uint32_t) (val) & (std::uint32_t) 0xff000000U) >> 24)))
 
-#define UINT16_SWAP_BE_LE(val) ((uint16) ( \
-(((uint16) (val) & (uint16) 0x00ffU) << 8) | \
-(((uint16) (val) & (uint16) 0xff00U) >> 8)))
+#define UINT16_SWAP_BE_LE(val) ((std::uint16_t) ( \
+(((std::uint16_t) (val) & (std::uint16_t) 0x00ffU) << 8) | \
+(((std::uint16_t) (val) & (std::uint16_t) 0xff00U) >> 8)))
 
-#define SYNCHSAFE_B1(val) (((uint32) (val) >> 21) & (uint32) 0x000007F)
-#define SYNCHSAFE_B2(val) (((uint32) (val) >> 14) & (uint32) 0x000007F)
-#define SYNCHSAFE_B3(val) (((uint32) (val) >> 7) & (uint32) 0x000007F)
-#define SYNCHSAFE_B4(val) (((uint32) (val) & (uint32) 0x0000007F))
+#define SYNCHSAFE_B1(val) (((std::uint32_t) (val) >> 21) & (std::uint32_t) 0x000007F)
+#define SYNCHSAFE_B2(val) (((std::uint32_t) (val) >> 14) & (std::uint32_t) 0x000007F)
+#define SYNCHSAFE_B3(val) (((std::uint32_t) (val) >> 7) & (std::uint32_t) 0x000007F)
+#define SYNCHSAFE_B4(val) (((std::uint32_t) (val) & (std::uint32_t) 0x0000007F))
 
-#define NOT_SYNCHSAFE_B1(val) (uint8) (((val) & (uint32) 0xff000000U) >> 24);
-#define NOT_SYNCHSAFE_B2(val) (uint8) (((val) & (uint32) 0x00ff0000U) >> 16);
-#define NOT_SYNCHSAFE_B3(val) (uint8) (((val) & (uint32) 0x0000ff00U) >>  8);
-#define NOT_SYNCHSAFE_B4(val) (uint8) ((val) & (uint32)  0x000000ffU);
+#define NOT_SYNCHSAFE_B1(val) (std::uint8_t) (((val) & (std::uint32_t) 0xff000000U) >> 24);
+#define NOT_SYNCHSAFE_B2(val) (std::uint8_t) (((val) & (std::uint32_t) 0x00ff0000U) >> 16);
+#define NOT_SYNCHSAFE_B3(val) (std::uint8_t) (((val) & (std::uint32_t) 0x0000ff00U) >>  8);
+#define NOT_SYNCHSAFE_B4(val) (std::uint8_t) ((val) & (std::uint32_t)  0x000000ffU);
 
+// Text in SonyDb's public char-based API is UTF-8. OMGAUDIO stores text as
+// UTF-16, normally in big-endian byte order.
 utf16char *ansi_to_utf16(const char  *str, long len, bool endian);
 char *utf16_to_ansi(const utf16char *str, long len, bool endian);
 
@@ -82,6 +75,11 @@ char *utf16_to_ansi(const utf16char *str, long len, bool endian);
 #define ENCODING_USE_NONE	      0
 #define ENCODING_USE_TABLE	      1
 #define ENCODING_USE_KEY	      2
+
+#define EXPORT_OK                 0
+#define EXPORT_NOT_FOUND          1
+#define EXPORT_ALREADY_EXISTS     2
+#define EXPORT_FAILED             3
 
 #define DATABASE_HEADER_SIZE 0
 
@@ -103,7 +101,8 @@ typedef struct {
      
      int       sonyDbOrder;
      int       statusOfSong; //0 was present on player, 1 was not present on player needs & to be added, 2 was present & needs to be removed
-     uint8     encoding; // mpeg version(2bits), layer version(2bits), bitrate(4bits)
+     // Four-byte OMGAUDIO codec field: codec, flags, MPEG parameters, mode.
+     std::uint32_t    encoding;
 } Song;
 
 typedef struct {
@@ -114,41 +113,41 @@ typedef struct {
 
 typedef struct
 {
-  uint8 magic[4];      /* "magic file descriptor" */
-  uint8 cte[4];        /* Constant value */
-  uint8 count;         /* Number of object pointers */
-  uint8 padding[7];    /* padding to 16 bytes */
+  std::uint8_t magic[4];      /* "magic file descriptor" */
+  std::uint8_t cte[4];        /* Constant value */
+  std::uint8_t count;         /* Number of object pointers */
+  std::uint8_t padding[7];    /* padding to 16 bytes */
 } sonyFileHeader;
 
 typedef struct
 {
-  uint8  magic[4];      /* magic (same as object) */
-  uint32 offset;        /* offset of the object (from the beginning)*/
-  uint32 length;        /* size of object in bytes */
-  uint32 padding;       /* padding to 16 bytes */
+  std::uint8_t  magic[4];      /* magic (same as object) */
+  std::uint32_t offset;        /* offset of the object (from the beginning)*/
+  std::uint32_t length;        /* size of object in bytes */
+  std::uint32_t padding;       /* padding to 16 bytes */
 } sonyObjectPointer;
 
 typedef struct
 {
-  uint8 magic[4];       /* magic (same as object pointer) */
-  uint16 count;         /* record count */
-  uint16 size;		/* record size */
-  uint32 padding[2];    /* padding to 16 bytes */
+  std::uint8_t magic[4];       /* magic (same as object pointer) */
+  std::uint16_t count;         /* record count */
+  std::uint16_t size;		/* record size */
+  std::uint32_t padding[2];    /* padding to 16 bytes */
 } sonyObject;
 
 typedef struct
 {
- uint8  fileType[4];
- uint32 trackEncoding;
- uint32 trackLength;
- uint16 nbTagRecords;
- uint16 sizeTagRecords;
+ std::uint8_t  fileType[4];
+ std::uint32_t trackEncoding;
+ std::uint32_t trackLength;
+ std::uint16_t nbTagRecords;
+ std::uint16_t sizeTagRecords;
 } sonyTrack;
 
 typedef struct
 {
-     uint8 tagType[4];
-     uint8 tagEncoding[2];
+     std::uint8_t tagType[4];
+     std::uint8_t tagEncoding[2];
 }sonyTrackTag;
 
 bool sortByIndex(Song *a, Song *b);
@@ -196,11 +195,12 @@ class SonyDb
 
      /* encoding decoding*/
      int  getTrackNumber(char *filename); //read the track number directly from the omg header
-     uint32 DvId;
+     std::uint32_t DvId;
      int  codeType; //0 no code, 1 decodeKeys.dat, 2 DvId.dat
 
      /* copy progress */
      bool copying; //currently getting or adding Oma files, or rewriting db
+     bool databaseDirty;
      int  copyIndex; //current file index
      float copyPercent;// progress of the current file (in percent)
 
@@ -237,7 +237,7 @@ class SonyDb
 
 
      /* decoder encoder */
-     uint8 codeTable[1024];
+     std::uint8_t codeTable[1024];
      bool loadCodeTable(int id);
      bool addOMA(Song *s, int destination);
      void deleteOMA(char *filename);
@@ -269,7 +269,14 @@ class SonyDb
      bool addSong(Song *s); //add to the database
      int  delSong(Song *s); //del to the database
 	 bool updSong(Song *s); //update to the database
+     bool addSongCopy(const Song &song);
+     bool removeSong(int order, const char *filename);
+     bool updateSong(int order, const char *filename, const Song &values);
+     bool hasPendingChanges() const;
      bool getOMA(Song *s, char *destination);//download oma to mp3
+     std::string exportPathForSong(int order, const char *destination) const;
+     int exportSong(int order, const char *destination, bool overwrite,
+                    std::string *outputPath = 0);
 
      
      /*encode decoder*/
@@ -282,6 +289,9 @@ class SonyDb
      int  getCopyPercent();
      bool detectPlayer();
      bool detectPlayer(char* drive);
+     bool detectPlayerStorage();
+     bool detectPlayerStorage(char* drive);
+     bool initializePlayer();
      char* getDriveLetter();
      int  getNumberOfTracks();
      char *getDeviceName();

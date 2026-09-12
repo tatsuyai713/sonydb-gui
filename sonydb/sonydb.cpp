@@ -7,7 +7,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <fstream>
+#include <filesystem>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <glob.h>
+#include <mntent.h>
+#include <limits.h>
+#include <set>
+#include <system_error>
+#include <sys/statvfs.h>
+#endif
 #include "sonydb.h"
+
+#include <codecvt>
+#include <locale>
 
 using namespace std;
 
@@ -42,6 +55,17 @@ static int STRNCMP_NULLOK(const char *pa, const char *pb, int size)
 	return strnicmp(pa, pb, size);
 }
 
+static std::u16string utf8_to_utf16_string(const char *text)
+{
+	if (!text) return {};
+	try {
+		std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
+		return converter.from_bytes(text);
+	} catch (const std::range_error &) {
+		return {};
+	}
+}
+
 
 
 SonyDb::SonyDb()
@@ -54,6 +78,7 @@ SonyDb::SonyDb()
 	this->lastTrackIndex = 1;
 	this->codeType = ENCODING_USE_NONE;
 	this->copying = false;
+	this->databaseDirty = false;
 	this->copyIndex = 0;
 	this->copyPercent = 0;
 	this->addTrackTotalByte = 0;
@@ -375,6 +400,7 @@ bool SonyDb::updSong(Song *songToUpd)
 					song->track_nr = songToUpd->track_nr;
 					song->songlen = songToUpd->songlen;
 					song->year = songToUpd->year;
+					databaseDirty = true;
 					return (true);
 				}
 				return (false);
@@ -399,6 +425,7 @@ bool SonyDb::updSong(Song *songToUpd)
 					song->track_nr = songToUpd->track_nr;
 					song->songlen = songToUpd->songlen;
 					song->year = songToUpd->year;
+					databaseDirty = true;
 					return (true);
 				}
 				return (false);
@@ -428,6 +455,7 @@ int SonyDb::delSong(Song *songToDel)
 					struct stat results;
 					if (stat((*songToDel).filename, &results) == 0)
 						addTrackTotalByte -= results.st_size;
+					databaseDirty = true;
 					return (2);
 				}
 			}
@@ -451,6 +479,7 @@ int SonyDb::delSong(Song *songToDel)
 					struct stat results;
 					if (stat((*songToDel).filename, &results) == 0)
 						addTrackTotalByte -= results.st_size;
+					databaseDirty = true;
 					return (2);
 				}
 				if ((*song).statusOfSong == ON_DEVICE)
@@ -461,6 +490,7 @@ int SonyDb::delSong(Song *songToDel)
 					struct stat results;
 					if (stat((*songToDel).filename, &results) == 0)
 						delTrackTotalByte += results.st_size;
+					databaseDirty = true;
 					return (1);
 				}
 			}
@@ -496,6 +526,7 @@ bool SonyDb::addSong(Song *songToAdd)
 		songToAdd->sonyDbOrder = 0;
 		songs_temporary.push_back(*songToAdd);
 		nbTrackToAdd++;
+		databaseDirty = true;
 	}
 	else
 	{
@@ -519,9 +550,101 @@ bool SonyDb::addSong(Song *songToAdd)
 		nbTrackToAdd++;
 		songToAdd->sonyDbOrder = 0; //changed when copied to the device in writeTracks
 		songs.push_back(*songToAdd);
+		databaseDirty = true;
 	}
 
 	return (true);
+}
+
+bool SonyDb::addSongCopy(const Song &source)
+{
+	Song copy = source;
+	copy.album = strdup(source.album ? source.album : "");
+	copy.artist = strdup(source.artist ? source.artist : "");
+	copy.title = strdup(source.title ? source.title : "");
+	copy.genre = strdup(source.genre ? source.genre : "");
+	copy.filename = strdup(source.filename ? source.filename : "");
+	copy.wAlbum = 0;
+	copy.wArtist = 0;
+	copy.wTitle = 0;
+	copy.wGenre = 0;
+	if (addSong(&copy))
+		return true;
+	free(copy.album);
+	free(copy.artist);
+	free(copy.title);
+	free(copy.genre);
+	free(copy.filename);
+	return false;
+}
+
+bool SonyDb::removeSong(int order, const char *filename)
+{
+	for (vector<Song>::iterator song = songs.begin(); song != songs.end(); ++song)
+	{
+		const bool match = order > 0 ? song->sonyDbOrder == order
+			: (filename && song->filename && strcmp(song->filename, filename) == 0);
+		if (!match)
+			continue;
+
+		struct stat results;
+		if (song->statusOfSong == ADD_TO_DEVICE)
+		{
+			if (stat(song->filename, &results) == 0)
+				addTrackTotalByte -= results.st_size;
+			free(song->album);
+			free(song->artist);
+			free(song->title);
+			free(song->genre);
+			free(song->filename);
+			songs.erase(song);
+			nbTrackToAdd--;
+			databaseDirty = true;
+			return true;
+		}
+		if (song->statusOfSong == ON_DEVICE)
+		{
+			song->statusOfSong = REMOVE_FROM_DEVICE;
+			if (stat(song->filename, &results) == 0)
+				delTrackTotalByte += results.st_size;
+			nbTrackToDel++;
+			databaseDirty = true;
+			return true;
+		}
+		return false;
+	}
+	return false;
+}
+
+bool SonyDb::updateSong(int order, const char *filename, const Song &values)
+{
+	for (vector<Song>::iterator song = songs.begin(); song != songs.end(); ++song)
+	{
+		const bool match = order > 0 ? song->sonyDbOrder == order
+			: (filename && song->filename && strcmp(song->filename, filename) == 0);
+		if (!match || song->statusOfSong == REMOVE_FROM_DEVICE || song->statusOfSong == EMPTYTRACK)
+			continue;
+
+		free(song->album);
+		free(song->artist);
+		free(song->title);
+		free(song->genre);
+		song->album = strdup(values.album ? values.album : "");
+		song->artist = strdup(values.artist ? values.artist : "");
+		song->title = strdup(values.title ? values.title : "");
+		song->genre = strdup(values.genre ? values.genre : "");
+		song->track_nr = values.track_nr;
+		song->songlen = values.songlen;
+		song->year = values.year;
+		databaseDirty = true;
+		return true;
+	}
+	return false;
+}
+
+bool SonyDb::hasPendingChanges() const
+{
+	return databaseDirty;
 }
 
 
@@ -655,8 +778,9 @@ bool SonyDb::writeTrackTag(sonyTrackTag *tt, char *input, FILE *f)
 	int size = TAGSIZE;
 	utf16char *tagRecord;
 
-	//to utf16
-	tagRecord = ansi_to_utf16(input, (size - 6), true);
+	// The fixed record payload is measured in bytes, while the converter's
+	// capacity is measured in UTF-16 code units.
+	tagRecord = ansi_to_utf16(input, (size - 6) / sizeof(utf16char), true);
 
 	//write tracktag (tagtype + encoding)
 	if (fwrite(tt, sizeof(sonyTrackTag), 1, f) != 1) return (false);
@@ -677,7 +801,7 @@ void SonyDb::setTable(char *TableFileName, int type)
 	{
 		FILE *t = fopen(decodeTableFilename, "rb");
 		fseek(t, 0x0a, SEEK_SET);
-		fread(&(this->DvId), sizeof(uint32), 1, t);
+		fread(&(this->DvId), sizeof(std::uint32_t), 1, t);
 		this->DvId = UINT32_SWAP_BE_LE(this->DvId);
 		fclose(t);
 	}
@@ -689,21 +813,21 @@ void SonyDb::setTable(char *TableFileName, int type)
 bool SonyDb::loadCodeTable(int id)
 {
 	FILE *t;
-	uint8 *header1 = (uint8*)malloc(sizeof(uint8) * 134); //deserialize manually ...
-	uint8 *header2 = (uint8*)malloc(sizeof(uint8) * 10);
-	uint8 *tmp = (uint8*)malloc(sizeof(uint8) * 256);
+	std::uint8_t *header1 = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 134); //deserialize manually ...
+	std::uint8_t *header2 = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 10);
+	std::uint8_t *tmp = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 256);
 
 	t = fopen(decodeTableFilename, "rb");
 	// place cursor in place...
 	fseek(t, 0x4B0 * id, SEEK_SET);
-	fread(header1, sizeof(uint8), 134, t);
+	fread(header1, sizeof(std::uint8_t), 134, t);
 
 	for (int i = 0; i < 4; i++)
 	{
-		fread(tmp, sizeof(uint8), 256, t);
+		fread(tmp, sizeof(std::uint8_t), 256, t);
 		for (int j = 0; j < 256; j++)
 			codeTable[(i*256) + j] = tmp[j];
-		fread(header2, sizeof(uint8), 10, t);
+		fread(header2, sizeof(std::uint8_t), 10, t);
 	}
 
 	free(header1);
@@ -716,7 +840,7 @@ bool SonyDb::loadCodeTable(int id)
 //add mp3 file to device
 bool SonyDb::addOMA(Song *s, int destination)
 {
-	uint32    key = 0xFFFFFFFF;
+	std::uint32_t    key = 0xFFFFFFFF;
 	bool      isVBR = false;
 
 	this->copyPercent = 0;
@@ -763,7 +887,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 	if (stat(s->filename, &results) == 0)
 		finSize = results.st_size;
 
-	uint8	    *header = (uint8*)malloc(sizeof(uint8) * 11);
+	std::uint8_t	    *header = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 11);
 	utf16char	    *tagRecord;
 	char	    *tmpTag = (char*)malloc(sizeof(char) * 256);
 	int	    tagLength;
@@ -773,7 +897,15 @@ bool SonyDb::addOMA(Song *s, int destination)
 
 	memset(header, 0, 11);
 	if (fread(header, 1, 10, fin) != 10)
+	{
+		free(header);
+		free(tmpTag);
+		fclose(fout);
+		fclose(fin);
+		remove(filename);
+		free(filename);
 		return false;
+	}
 	if (STRNCMP_NULLOK((char*)header, "ID3", 3) == 0)
 	{
 		//skip Idv2 tags
@@ -793,17 +925,21 @@ bool SonyDb::addOMA(Song *s, int destination)
 	//skip zeros
 	while (header[0] == 0)
 	{
-		if(fread(header, sizeof(uint8), 1, fin) != 1)
+		if(fread(header, sizeof(std::uint8_t), 1, fin) != 1)
 		{
+			free(header);
+			free(tmpTag);
 			fclose(fout);
 			fclose(fin);
+			remove(filename);
+			free(filename);
 			return false;
 		}
 	}
 
 	if (header[0] == 0xFF)
 	{
-		if (fread(header, sizeof(uint8), 3, fin) != 3)
+		if (fread(header, sizeof(std::uint8_t), 3, fin) != 3)
 		{
 			fclose(fout);
 			fclose(fin);
@@ -813,24 +949,37 @@ bool SonyDb::addOMA(Song *s, int destination)
 		//get mpeg type, layer type and bitrate
 		if ((header[0] & 0xE0) == 0xE0) //we found the first frame
 		{
-			//encoding =  mpeg version(2bits), layer version(2bits), bitrate(4bits)
-			s->encoding = ( ((header[0] & 0x1E) << 3) + ((header[1] & 0xF0) >> 4) );
+			// OMGAUDIO stores a complete four-byte codec description.  The old
+			// code retained only the third byte, so the database did not identify
+			// transferred files as MP3 and affected players reported CANNOT PLAY.
+			const std::uint8_t codecParameters =
+				((header[0] & 0x18) << 3) | ((header[0] & 0x06) << 3) |
+				((header[1] & 0xF0) >> 4);
+			const std::uint8_t codecMode =
+				((header[1] & 0x0C) << 4) | ((header[2] & 0xC0) >> 2) |
+				((header[2] & 0x03) << 2);
+			s->encoding = (0x03U << 24) | (0x80U << 16) |
+				(static_cast<std::uint32_t>(codecParameters) << 8) | codecMode;
 
 			// 00 - MPEG Version 2.5 (unofficial extension of MPEG 2)
 			// 01 - reserved
 			// 10 - MPEG Version 2 (ISO/IEC 13818-3)
 			// 11 - MPEG Version 1 (ISO/IEC 11172-3) 
-			uint8 mpegVersion = (header[0] & 0x18) >> 3;
+			std::uint8_t mpegVersion = (header[0] & 0x18) >> 3;
 
 			//00 - reserved
 			//01 - Layer III
 			//10 - Layer II
 			//11 - Layer I
-			uint8 layerVersion = (header[0] & 0x06) >> 1;
+			std::uint8_t layerVersion = (header[0] & 0x06) >> 1;
 
-			uint8 samplingRateIndex = (header[1] & 0xC) >> 2;
+			std::uint8_t samplingRateIndex = (header[1] & 0xC) >> 2;
 
-			if (((mpegVersion * 3) + samplingRateIndex >= 12) || ((mpegVersion * 3) + layerVersion >= 16))
+			if (mpegVersion == 1 || layerVersion != 1 ||
+				(header[1] & 0xF0) == 0 || (header[1] & 0xF0) == 0xF0 ||
+				samplingRateIndex == 3 ||
+				((mpegVersion * 3) + samplingRateIndex >= 12) ||
+				((mpegVersion * 4) + layerVersion >= 16))
 			{
 				//header is invalid
 				nbFrames = 0;
@@ -853,11 +1002,11 @@ bool SonyDb::addOMA(Song *s, int destination)
 			}
 
 			//skip the the frame header
-			fseek(fin, sizeof(uint8) * 32, SEEK_CUR);
+			fseek(fin, sizeof(std::uint8_t) * 32, SEEK_CUR);
 
 			//check if first is "XING" for VBR files
 			memset(header, 0, 11);
-			if (fread(header, sizeof(uint8), 4, fin) != 4)
+			if (fread(header, sizeof(std::uint8_t), 4, fin) != 4)
 			{
 				fclose(fout);
 				fclose(fin);
@@ -865,20 +1014,35 @@ bool SonyDb::addOMA(Song *s, int destination)
 			}
 
 			if (STRNCMP_NULLOK((char*)header, "XING", 4) == 0)
+			{
 				isVBR = true;
+				s->encoding |= (0x10U << 16);
+			}
 		}
 		else
 		{
 			fprintf(fp, "File format invalid, could not find first frame%s\n", s->filename);
 			fflush(fp);
-			//return false;
+			free(header);
+			free(tmpTag);
+			fclose(fout);
+			fclose(fin);
+			remove(filename);
+			free(filename);
+			return false;
 		}
 	}
 	else
 	{
 		fprintf(fp, "File format invalid, could not find first frame%s\n", s->filename);
 		fflush(fp);
-		//return false;
+		free(header);
+		free(tmpTag);
+		fclose(fout);
+		fclose(fin);
+		remove(filename);
+		free(filename);
+		return false;
 	}
 
 
@@ -901,9 +1065,9 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[2] = '3';
 	header[3] = 0x03;
 	//...zeros
-	header[8] = 0x17;
-	header[9] = 0x76; //size of tag header in Synchsafe format (=3072 bytes - 10 of header)
-	if (fwrite(header, sizeof(uint8), 10, fout) != 10)
+	header[8] = 0x1f;
+	header[9] = 0x76; //size of tag header in Synchsafe format (=4096 bytes - 10 of header)
+	if (fwrite(header, sizeof(std::uint8_t), 10, fout) != 10)
 	{
 		fclose(fout);
 		fclose(fin);
@@ -913,7 +1077,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 	//title tag
 	memset(header, 0, 11);
 	memcpy(header, "TIT2", 4);
-	tagLength = strlen(s->title);
+	tagLength = static_cast<int>(utf8_to_utf16_string(s->title).size());
 	tagRecord = ansi_to_utf16(s->title, tagLength + 1, true);
 	tagLength = (tagLength * 2) + 1;
 	header[4] = NOT_SYNCHSAFE_B1(tagLength);//size of the title
@@ -924,13 +1088,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -944,7 +1108,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 	//artist tag
 	memset(header, 0, 11);
 	memcpy(header, "TPE1", 4);
-	tagLength = strlen(s->artist);
+	tagLength = static_cast<int>(utf8_to_utf16_string(s->artist).size());
 	tagRecord = ansi_to_utf16(s->artist, tagLength + 1, true);
 	tagLength = (tagLength * 2) + 1;
 	header[4] = NOT_SYNCHSAFE_B1(tagLength);//size of the title
@@ -955,13 +1119,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -974,7 +1138,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 	//album tag
 	memset(header, 0, 11);
 	memcpy(header, "TALB", 4);
-	tagLength = strlen(s->album);
+	tagLength = static_cast<int>(utf8_to_utf16_string(s->album).size());
 	tagRecord = ansi_to_utf16(s->album, tagLength + 1, true);
 	tagLength = (tagLength * 2) + 1;
 	header[4] = NOT_SYNCHSAFE_B1(tagLength);//size of the title
@@ -985,13 +1149,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -1004,7 +1168,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 	//genre tag
 	memset(header, 0, 11);
 	memcpy(header, "TCON", 4);
-	tagLength = strlen(s->genre);
+	tagLength = static_cast<int>(utf8_to_utf16_string(s->genre).size());
 	tagRecord = ansi_to_utf16(s->genre, tagLength + 1, true);
 	tagLength = (tagLength * 2) + 1;
 	header[4] = NOT_SYNCHSAFE_B1(tagLength);//size of the title
@@ -1015,13 +1179,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -1046,13 +1210,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -1078,13 +1242,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -1109,13 +1273,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header[9] = 0;  //flag 2
 	header[10] = 0x02;  //
 	tagLength = (tagLength - 1 )/ 2;
-	if (fwrite(header, sizeof(uint8), 11, fout) != 11)
+	if (fwrite(header, sizeof(std::uint8_t), 11, fout) != 11)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (11 * sizeof(uint8));
+	headerLength += (11 * sizeof(std::uint8_t));
 	if (fwrite(tagRecord, sizeof(utf16char), tagLength, fout) != tagLength)
 	{
 		fclose(fout);
@@ -1127,10 +1291,10 @@ bool SonyDb::addOMA(Song *s, int destination)
 
 	memset(header, 0, 11);
 	//fill the rest with 0
-	while (headerLength < 3062)
+	while (headerLength < 4086)
 	{
-		headerLength += sizeof(uint8);
-		if (fwrite(header, sizeof(uint8), 1, fout) != 1)
+		headerLength += sizeof(std::uint8_t);
+		if (fwrite(header, sizeof(std::uint8_t), 1, fout) != 1)
 		{
 			fclose(fout);
 			fclose(fin);
@@ -1139,7 +1303,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 	}
 
 	//write second header fixme (some stuff are missing here... important?)
-	uint8 *header2 = (uint8*)malloc(sizeof(uint8) * 16);
+	std::uint8_t *header2 = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 16);
 	headerLength = 0;
 	memset(header2, 0, 16);
 	//first line
@@ -1160,13 +1324,13 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header2[13] = 0x0F;
 	header2[14] = 0x50;
 	header2[15] = 0x00;// - same value as in 05CIDLST.DAT
-	if (fwrite(header2, sizeof(uint8), 16, fout) != 16)
+	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (16 * sizeof(uint8));
+	headerLength += (16 * sizeof(std::uint8_t));
 
 	//second line
 	memset(header2, 0, 16);
@@ -1183,63 +1347,63 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header2[13] = 0x22; //fixme 22
 	header2[14] = 0x33; //fixme 33
 	header2[15] = 0x44;// - same value as in 05CIDLST.DAT
-	if (fwrite(header2, sizeof(uint8), 16, fout) != 16)
+	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (16 * sizeof(uint8));
+	headerLength += (16 * sizeof(std::uint8_t));
 
 	//third line
 	memset(header2, 0, 16); 
 
-	header2[0] = 0x03;// 3 = MP3
-	header2[1] =(isVBR) ? 0x90 : 0x80 ;// VBR = 90, CBR = 80
-	header2[2] = s->encoding;// mpeg version(2bits), layer version(2bits), bitrate(4bits)
-	header2[3] = 0x10;//?? fixme
+	header2[0] = static_cast<std::uint8_t>((s->encoding >> 24) & 0xff);// 3 = MP3
+	header2[1] = static_cast<std::uint8_t>((s->encoding >> 16) & 0xff);
+	header2[2] = static_cast<std::uint8_t>((s->encoding >> 8) & 0xff);
+	header2[3] = static_cast<std::uint8_t>(s->encoding & 0xff);
 
 	//tracklength
-	uint32 trackLengh = s->songlen * 1000; 
-	header2[4] = (uint8) (((trackLengh) & (uint32) 0xff000000U) >> 24);
-	header2[5] = (uint8) (((trackLengh) & (uint32) 0x00ff0000U) >> 16);
-	header2[6] = (uint8) (((trackLengh) & (uint32) 0x0000ff00U) >>  8);
-	header2[7] = (uint8) ((trackLengh) & (uint32)  0x000000ffU);
+	std::uint32_t trackLengh = s->songlen * 1000; 
+	header2[4] = (std::uint8_t) (((trackLengh) & (std::uint32_t) 0xff000000U) >> 24);
+	header2[5] = (std::uint8_t) (((trackLengh) & (std::uint32_t) 0x00ff0000U) >> 16);
+	header2[6] = (std::uint8_t) (((trackLengh) & (std::uint32_t) 0x0000ff00U) >>  8);
+	header2[7] = (std::uint8_t) ((trackLengh) & (std::uint32_t)  0x000000ffU);
 
 	//number of frames
-	header2[8] = (uint8) (((nbFrames) & (uint32) 0xff000000U) >> 24);
-	header2[9] = (uint8) (((nbFrames) & (uint32) 0x00ff0000U) >>  16);
-	header2[10] = (uint8) (((nbFrames) & (uint32) 0x0000ff00U) >>  8);
-	header2[11] = (uint8) ((nbFrames) & (uint32)  0x000000ffU); 
+	header2[8] = (std::uint8_t) (((nbFrames) & (std::uint32_t) 0xff000000U) >> 24);
+	header2[9] = (std::uint8_t) (((nbFrames) & (std::uint32_t) 0x00ff0000U) >>  16);
+	header2[10] = (std::uint8_t) (((nbFrames) & (std::uint32_t) 0x0000ff00U) >>  8);
+	header2[11] = (std::uint8_t) ((nbFrames) & (std::uint32_t)  0x000000ffU); 
 
 	//padding
 	header2[12] = 0x00;
 	header2[13] = 0x00;
 	header2[14] = 0x00;
 	header2[15] = 0x00;
-	if (fwrite(header2, sizeof(uint8), 16, fout) != 16)
+	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	headerLength += (16 * sizeof(uint8));
+	headerLength += (16 * sizeof(std::uint8_t));
 
 	//padding
 	memset(header2, 0, 16);
-	if (fwrite(header2, sizeof(uint8), 16, fout) != 16)
+	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	if (fwrite(header2, sizeof(uint8), 16, fout) != 16)
+	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
 		fclose(fin);
 		return false;
 	}
-	if (fwrite(header2, sizeof(uint8), 16, fout) != 16)
+	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
 		fclose(fin);
@@ -1253,8 +1417,8 @@ bool SonyDb::addOMA(Song *s, int destination)
 
 	int   BLOCK_SIZE = 32767;
 	int   blockNumber = 1;
-	uint8 *inputData = (uint8 *)malloc(sizeof(uint8) * BLOCK_SIZE);
-	uint8 *outputData = (uint8 *)malloc(sizeof(uint8) * BLOCK_SIZE);
+	std::uint8_t *inputData = (std::uint8_t *)malloc(sizeof(std::uint8_t) * BLOCK_SIZE);
+	std::uint8_t *outputData = (std::uint8_t *)malloc(sizeof(std::uint8_t) * BLOCK_SIZE);
 	int   nbRead;
 	long  position = 0;
 
@@ -1276,7 +1440,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 			}
 			position++;
 		}
-		if (fwrite(outputData, sizeof(uint8), nbRead, fout) != nbRead)
+		if (fwrite(outputData, sizeof(std::uint8_t), nbRead, fout) != nbRead)
 		{
 			fclose(fout);
 			fclose(fin);
@@ -1311,36 +1475,163 @@ int  SonyDb::getCopyPercent()
 	return (int)(this->copyPercent);
 }
 
+static string sanitizeExportName(const char *value)
+{
+	string result = value ? value : "";
+	for (string::iterator ch = result.begin(); ch != result.end(); ++ch)
+	{
+		if (*ch == '/' || *ch == '\\' || static_cast<unsigned char>(*ch) < 0x20)
+			*ch = '_';
+	}
+	return result;
+}
+
+static string exportDirectoryName(const char *value, const char *fallback)
+{
+	string result = sanitizeExportName(value);
+	if (result.empty() || result == "." || result == "..")
+		return fallback;
+	return result;
+}
+
+static string exportArtistFor(const Song *song, const vector<Song> &songs)
+{
+	const string artist = exportDirectoryName(song->artist, "Unknown Artist");
+	if (!song->album || !*song->album)
+		return artist;
+	for (vector<Song>::const_iterator other = songs.begin(); other != songs.end(); ++other)
+	{
+		if (other->statusOfSong != ON_DEVICE ||
+			STRCMP2_NULLOK(other->album, song->album) != 0)
+			continue;
+		if (STRCMP2_NULLOK(exportDirectoryName(other->artist, "Unknown Artist").c_str(),
+			artist.c_str()) != 0)
+			return "Various Artists";
+	}
+	return artist;
+}
+
+static string exportPathFor(const Song *song, const vector<Song> &songs,
+	const char *destination)
+{
+	if (!song || !destination || !*destination)
+		return "";
+	const filesystem::path directory = filesystem::path(destination)
+		/ exportArtistFor(song, songs)
+		/ exportDirectoryName(song->album, "Unknown Album");
+	char track[32];
+	snprintf(track, sizeof(track), "%02i", song->track_nr);
+	const string title = exportDirectoryName(song->title, "Unknown Title");
+	return (directory / (string(track) + " - " + title + ".mp3")).string();
+}
+
+string SonyDb::exportPathForSong(int order, const char *destination) const
+{
+	for (vector<Song>::const_iterator song = songs.begin(); song != songs.end(); ++song)
+	{
+		if (song->sonyDbOrder == order && song->statusOfSong == ON_DEVICE)
+			return exportPathFor(&(*song), songs, destination);
+	}
+	return "";
+}
+
+int SonyDb::exportSong(int order, const char *destination, bool overwrite,
+	string *outputPath)
+{
+	for (vector<Song>::iterator song = songs.begin(); song != songs.end(); ++song)
+	{
+		if (song->sonyDbOrder != order || song->statusOfSong != ON_DEVICE)
+			continue;
+		const string path = exportPathFor(&(*song), songs, destination);
+		if (outputPath)
+			*outputPath = path;
+		struct stat existing;
+		if (!overwrite && stat(path.c_str(), &existing) == 0)
+			return EXPORT_ALREADY_EXISTS;
+		error_code directoryError;
+		filesystem::create_directories(filesystem::path(path).parent_path(), directoryError);
+		if (directoryError)
+			return EXPORT_FAILED;
+		if (!getOMA(&(*song), const_cast<char *>(destination)))
+			return EXPORT_FAILED;
+		return EXPORT_OK;
+	}
+	return EXPORT_NOT_FOUND;
+}
+
 //some code is from GYM
 bool SonyDb::getOMA(Song *s, char *destination)
 {
 	if (s->statusOfSong == ADD_TO_DEVICE)
 		return (false);
 
-	char	    filename[512];
-	uint8	    *header = (uint8*)malloc(sizeof(uint8) * 11);
+	const string filename = exportPathFor(s, songs, destination);
+	const string partialFilename = filename + ".sonydb-part";
+	std::uint8_t	    *header = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 11);
 	char	    *tmpTag = (char*)malloc(sizeof(char) * 256);
 	int	    tagLength;
 	int	    headerLength = 0;
-	uint32	    key = 0xFFFFFFFF;
+	std::uint32_t	    key = 0xFFFFFFFF;
 
 	//open the file
-	sprintf(filename, "%s%s - %s - %02i - %s.mp3", destination, s->album, s->artist, s->track_nr, s->title);
-
-	fprintf(fp, "getting file from %s to %s\n", s->filename, filename);
+	fprintf(fp, "getting file from %s to %s\n", s->filename, filename.c_str());
 	fflush(fp);
-
-	FILE *fout = fopen(filename, "wb");
-	if (fout == NULL)
-	{
-		fprintf(fp, "error can't open file %s\n", filename);fflush(fp);
-		return false;
-	}
 
 	FILE *fin = fopen(s->filename, "rb");
 	if (fin == NULL)
 	{
 		fprintf(fp, "error can't open file %s\n", s->filename);fflush(fp);
+		return false;
+	}
+
+	// Locate the audio from the size stored in the ea3 metadata header.  Sony
+	// software and different Walkman generations use different metadata block
+	// sizes, so the old fixed 0xC60 offset truncated or corrupted some exports.
+	std::uint8_t omaMetadataHeader[10];
+	std::uint8_t omaFormatHeader[96];
+	if (fread(omaMetadataHeader, 1, sizeof(omaMetadataHeader), fin) != sizeof(omaMetadataHeader) ||
+		memcmp(omaMetadataHeader, "ea3", 3) != 0)
+	{
+		fprintf(fp, "error invalid OMA metadata header: %s\n", s->filename);fflush(fp);
+		fclose(fin);
+		return false;
+	}
+	const long metadataSize =
+		((omaMetadataHeader[6] & 0x7f) << 21) |
+		((omaMetadataHeader[7] & 0x7f) << 14) |
+		((omaMetadataHeader[8] & 0x7f) << 7) |
+		(omaMetadataHeader[9] & 0x7f);
+	const long formatOffset = 10 + metadataSize;
+	if (metadataSize < 0 || fseek(fin, formatOffset, SEEK_SET) != 0 ||
+		fread(omaFormatHeader, 1, sizeof(omaFormatHeader), fin) != sizeof(omaFormatHeader) ||
+		memcmp(omaFormatHeader, "EA3", 3) != 0 || omaFormatHeader[32] != 0x03)
+	{
+		fprintf(fp, "error OMA does not contain MP3 audio: %s\n", s->filename);fflush(fp);
+		fclose(fin);
+		return false;
+	}
+	const std::uint16_t encryption =
+		(static_cast<std::uint16_t>(omaFormatHeader[6]) << 8) | omaFormatHeader[7];
+	if ((encryption == 0xffff && this->codeType != ENCODING_USE_NONE) ||
+		(encryption == 0xfffe && this->codeType == ENCODING_USE_NONE) ||
+		(encryption != 0xffff && encryption != 0xfffe))
+	{
+		fprintf(fp, "error unsupported OMA encryption 0x%04x: %s\n", encryption, s->filename);fflush(fp);
+		fclose(fin);
+		return false;
+	}
+	const long audioOffset = formatOffset + static_cast<long>(sizeof(omaFormatHeader));
+	if (fseek(fin, audioOffset, SEEK_SET) != 0)
+	{
+		fclose(fin);
+		return false;
+	}
+
+	FILE *fout = fopen(partialFilename.c_str(), "wb");
+	if (fout == NULL)
+	{
+		fprintf(fp, "error can't open file %s\n", partialFilename.c_str());fflush(fp);
+		fclose(fin);
 		return false;
 	}
 
@@ -1354,7 +1645,7 @@ bool SonyDb::getOMA(Song *s, char *destination)
 
 	//reserve 10bytes for the header
 	memset(header, 0, 11);
-	fwrite(header, sizeof(uint8), 10, fout);
+	fwrite(header, sizeof(std::uint8_t), 10, fout);
 
 	//title tag
 	memset(header, 0, 11);
@@ -1364,10 +1655,10 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	header[5] = SYNCHSAFE_B2(tagLength);
 	header[6] = SYNCHSAFE_B3(tagLength);
 	header[7] = SYNCHSAFE_B4(tagLength);
-	fwrite(header, sizeof(uint8), 11, fout);
-	headerLength += (11 * sizeof(uint8));
-	fwrite(s->title, sizeof(uint8), (tagLength - 1), fout);
-	headerLength += ((tagLength - 1) * sizeof(uint8));
+	fwrite(header, sizeof(std::uint8_t), 11, fout);
+	headerLength += (11 * sizeof(std::uint8_t));
+	fwrite(s->title, sizeof(std::uint8_t), (tagLength - 1), fout);
+	headerLength += ((tagLength - 1) * sizeof(std::uint8_t));
 
 
 	//artist tag
@@ -1378,10 +1669,10 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	header[5] = SYNCHSAFE_B2(tagLength);
 	header[6] = SYNCHSAFE_B3(tagLength);
 	header[7] = SYNCHSAFE_B4(tagLength);
-	fwrite(header, sizeof(uint8), 11, fout);
-	headerLength += (11 * sizeof(uint8));
-	fwrite(s->artist, sizeof(uint8), (tagLength - 1), fout);
-	headerLength += ((tagLength - 1) * sizeof(uint8));
+	fwrite(header, sizeof(std::uint8_t), 11, fout);
+	headerLength += (11 * sizeof(std::uint8_t));
+	fwrite(s->artist, sizeof(std::uint8_t), (tagLength - 1), fout);
+	headerLength += ((tagLength - 1) * sizeof(std::uint8_t));
 
 
 	//album tag
@@ -1392,10 +1683,10 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	header[5] = SYNCHSAFE_B2(tagLength);
 	header[6] = SYNCHSAFE_B3(tagLength);
 	header[7] = SYNCHSAFE_B4(tagLength);
-	fwrite(header, sizeof(uint8), 11, fout);
-	headerLength += (11 * sizeof(uint8));
-	fwrite(s->album, sizeof(uint8), (tagLength - 1), fout);
-	headerLength += ((tagLength - 1) * sizeof(uint8));
+	fwrite(header, sizeof(std::uint8_t), 11, fout);
+	headerLength += (11 * sizeof(std::uint8_t));
+	fwrite(s->album, sizeof(std::uint8_t), (tagLength - 1), fout);
+	headerLength += ((tagLength - 1) * sizeof(std::uint8_t));
 
 	//track number tag
 	sprintf(tmpTag, "%02i", s->track_nr);
@@ -1406,10 +1697,10 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	header[5] = SYNCHSAFE_B2(tagLength);
 	header[6] = SYNCHSAFE_B3(tagLength);
 	header[7] = SYNCHSAFE_B4(tagLength);
-	fwrite(header, sizeof(uint8), 11, fout);
-	headerLength += (11 * sizeof(uint8));
-	fwrite(tmpTag, sizeof(uint8), (tagLength - 1), fout);
-	headerLength += ((tagLength - 1) * sizeof(uint8));
+	fwrite(header, sizeof(std::uint8_t), 11, fout);
+	headerLength += (11 * sizeof(std::uint8_t));
+	fwrite(tmpTag, sizeof(std::uint8_t), (tagLength - 1), fout);
+	headerLength += ((tagLength - 1) * sizeof(std::uint8_t));
 
 	//year tag
 	if (s->year > 0)
@@ -1422,10 +1713,10 @@ bool SonyDb::getOMA(Song *s, char *destination)
 		header[5] = SYNCHSAFE_B2(tagLength);
 		header[6] = SYNCHSAFE_B3(tagLength);
 		header[7] = SYNCHSAFE_B4(tagLength);
-		fwrite(header, sizeof(uint8), 11, fout);
-		headerLength += (11 * sizeof(uint8));
-		fwrite(tmpTag, sizeof(uint8), (tagLength - 1), fout);
-		headerLength += ((tagLength - 1) * sizeof(uint8));
+		fwrite(header, sizeof(std::uint8_t), 11, fout);
+		headerLength += (11 * sizeof(std::uint8_t));
+		fwrite(tmpTag, sizeof(std::uint8_t), (tagLength - 1), fout);
+		headerLength += ((tagLength - 1) * sizeof(std::uint8_t));
 	}
 
 	//genre tag
@@ -1436,17 +1727,17 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	header[5] = SYNCHSAFE_B2(tagLength);
 	header[6] = SYNCHSAFE_B3(tagLength);
 	header[7] = SYNCHSAFE_B4(tagLength);
-	fwrite(header, sizeof(uint8), 11, fout);
-	headerLength += (11 * sizeof(uint8));
-	fwrite(s->genre, sizeof(uint8), (tagLength - 1), fout);
-	headerLength += ((tagLength - 1) * sizeof(uint8));
+	fwrite(header, sizeof(std::uint8_t), 11, fout);
+	headerLength += (11 * sizeof(std::uint8_t));
+	fwrite(s->genre, sizeof(std::uint8_t), (tagLength - 1), fout);
+	headerLength += ((tagLength - 1) * sizeof(std::uint8_t));
 
 	memset(header, 0, 11);
 	//fill the rest with 0
 	while ((headerLength %16) != 0)
 	{
-		headerLength += sizeof(uint8);
-		fwrite(header, sizeof(uint8), 1, fout);
+		headerLength += sizeof(std::uint8_t);
+		fwrite(header, sizeof(std::uint8_t), 1, fout);
 	}
 	//return to the start of the file to write the header;
 	fseek(fout, 0, SEEK_SET);
@@ -1460,7 +1751,7 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	header[7] = SYNCHSAFE_B2(headerLength);
 	header[8] = SYNCHSAFE_B3(headerLength);
 	header[9] = SYNCHSAFE_B4(headerLength);
-	fwrite(header, sizeof(uint8), 10, fout);
+	fwrite(header, sizeof(std::uint8_t), 10, fout);
 
 	//return after the header
 	fseek(fout, headerLength, SEEK_CUR);
@@ -1468,13 +1759,12 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	free(header);
 	free(tmpTag);
 
-	//skip the oma tags
-	fseek(fin, 0xC60, SEEK_SET);
+	// The input is already positioned immediately before the OMA audio payload.
 
 	int   BLOCK_SIZE = 32767;
 	int   blockNumber = 1;
-	uint8 *inputData = (uint8 *)malloc(sizeof(uint8) * BLOCK_SIZE);
-	uint8 *outputData = (uint8 *)malloc(sizeof(uint8) * BLOCK_SIZE);
+	std::uint8_t *inputData = (std::uint8_t *)malloc(sizeof(std::uint8_t) * BLOCK_SIZE);
+	std::uint8_t *outputData = (std::uint8_t *)malloc(sizeof(std::uint8_t) * BLOCK_SIZE);
 	int   nbRead;
 	long  position = 0;
 
@@ -1496,7 +1786,7 @@ bool SonyDb::getOMA(Song *s, char *destination)
 			}
 			position++;
 		}
-		fwrite(outputData, sizeof(uint8), nbRead, fout);
+		fwrite(outputData, sizeof(std::uint8_t), nbRead, fout);
 		blockNumber++;
 	}
 
@@ -1505,6 +1795,11 @@ bool SonyDb::getOMA(Song *s, char *destination)
 
 	fclose(fout);
 	fclose(fin);
+	if (rename(partialFilename.c_str(), filename.c_str()) != 0)
+	{
+		remove(partialFilename.c_str());
+		return false;
+	}
 	//sprintf(tmp, "del %s\n", filename);
 	//system(tmp);
 	return (true);
@@ -1562,6 +1857,7 @@ bool SonyDb::writeTracks()
 	vector<Song *> addList;
 	vector<Song *>::iterator iteAddList;
 	bool res = false;
+	bool copyFailed = false;
 
 	//create list of add & del
 	for (vector<Song>::iterator i = songs.begin(); i != songs.end(); i++)
@@ -1619,6 +1915,7 @@ bool SonyDb::writeTracks()
 				{
 					fprintf(fp,"Could not write file : %s\n", (*iteAddList)->filename);
 					fflush(fp);
+					copyFailed = true;
 					iteAddList++;
 					nbElementsLeftToAdd--;
 				}
@@ -1674,6 +1971,7 @@ bool SonyDb::writeTracks()
 		{
 			fprintf(fp,"Could not write file : %s\n", (*iteAddList)->filename);
 			fflush(fp);
+			copyFailed = true;
 			nbElementsLeftToAdd--;
 			iteAddList++;
 		}
@@ -1689,9 +1987,27 @@ bool SonyDb::writeTracks()
 	}
 
 	//write the new database to the device
-	res = writeDatabase(songlist);
+	const bool databaseWritten = writeDatabase(songlist);
+	res = databaseWritten && !copyFailed;
+#if defined(__linux__)
+	// Do not report completion while the kernel still has pending writes for a
+	// removable Walkman.  This avoids a successful-looking transfer followed by
+	// FAT corruption when the cable is disconnected immediately afterwards.
 	if (res)
+	{
+		const int deviceFd = open(getDriveLetter(), O_RDONLY | O_DIRECTORY);
+		if (deviceFd < 0 || syncfs(deviceFd) != 0)
+			res = false;
+		if (deviceFd >= 0)
+			close(deviceFd);
+	}
+#endif
+	if (databaseWritten)
+	{
 		fprintf(fp,"Writing database files: OK\n");
+		if (!copyFailed)
+			databaseDirty = false;
+	}
 	else
 		fprintf(fp,"Writing database files: FAILED\n");
 	fflush(fp);
@@ -1984,11 +2300,11 @@ int SonyDb::getTrackNumber(char *filename)
 		return (-1);
 	}
 	//fprintf(fp, "1 Opening file %s ok\n", filename);fflush(fp);
-	uint8     tmpTag[512];
-	uint32    tagLength = 0;
+	std::uint8_t     tmpTag[512];
+	std::uint32_t    tagLength = 0;
 
 	//read the id3 header
-	if (fread(&tmpTag, sizeof(uint8), 10, fin) != 10)
+	if (fread(&tmpTag, sizeof(std::uint8_t), 10, fin) != 10)
 	{
 		fprintf(fp, "error can't read file header : %s\n", filename);
 		fflush(fp);
@@ -2000,9 +2316,9 @@ int SonyDb::getTrackNumber(char *filename)
 	for (int i = 0; i < 5; i++)
 	{
 		//fprintf(fp, "Reading tag %i: ", i);fflush(fp);
-		if (fread(&tmpTag, sizeof(uint8), 11, fin) != 11)
+		if (fread(&tmpTag, sizeof(std::uint8_t), 11, fin) != 11)
 		{
-			fprintf(fp, "error can't read file tag %i : %s\n", filename, i);
+			fprintf(fp, "error can't read file tag %i : %s\n", i, filename);
 			fflush(fp);
 			fclose(fin);
 			return (-1);
@@ -2025,7 +2341,7 @@ int SonyDb::getTrackNumber(char *filename)
 			if ((STRNCMP_NULLOK((char*)tmpTag, "TXXX", 4) == 0))
 			{
 				memset(tmpTag, 0, 512);
-				if (fread(&tmpTag, sizeof(uint8), tagLength, fin) != tagLength)
+				if (fread(&tmpTag, sizeof(std::uint8_t), tagLength, fin) != tagLength)
 				{
 					fprintf(fp, "error can't read file 4 : %s\n", filename);
 					fflush(fp);
@@ -2033,7 +2349,7 @@ int SonyDb::getTrackNumber(char *filename)
 					return (-1);
 				}
 				tmpTag[19] = 20;//quick fix : replace '*' by a space in "OMG_TRACK*XXXX"
-				char *res1 = utf16_to_ansi((uint16*)tmpTag, tagLength, true);
+				char *res1 = utf16_to_ansi((std::uint16_t*)tmpTag, tagLength, true);
 				//fprintf(fp, "TRACK NUMBER : >%s<\n", res1);fflush(fp);
 				char *res2 = res1 + 10; //remove OMG_TRACK 
 				int res3 = atoi(res2);
@@ -2165,20 +2481,20 @@ int  SonyDb::readAllPlaylist()
 		return false;
 	}
 
-	uint16 index1;
-	uint16 index2;
-	uint16 cte1;
-	uint16 cte2;
+	std::uint16_t index1;
+	std::uint16_t index2;
+	std::uint16_t cte1;
+	std::uint16_t cte2;
 
-	vector<uint16> p1;
-	vector<uint16> p2;
+	vector<std::uint16_t> p1;
+	vector<std::uint16_t> p2;
 
 	for (int i = 0; i < obj2.count; i++)
 	{
-		fread(&index1, sizeof(uint16), 1, f);
-		fread(&cte1, sizeof(uint16), 1, f);
-		fread(&index2, sizeof(uint16), 1, f);
-		fread(&cte2, sizeof(uint16), 1, f);
+		fread(&index1, sizeof(std::uint16_t), 1, f);
+		fread(&cte1, sizeof(std::uint16_t), 1, f);
+		fread(&index2, sizeof(std::uint16_t), 1, f);
+		fread(&cte2, sizeof(std::uint16_t), 1, f);
 		index1 = UINT16_SWAP_BE_LE(index1);
 		index2 = UINT16_SWAP_BE_LE(index2);
 		p1.push_back(index1);
@@ -2199,7 +2515,7 @@ int  SonyDb::readAllPlaylist()
 	int catIndex = 0;
 	for (int j = 0; j < obj3.count; j++)
 	{
-		fread(&cte1, sizeof(uint16), 1, f);
+		fread(&cte1, sizeof(std::uint16_t), 1, f);
 		cte1 = UINT16_SWAP_BE_LE(cte1);
 
 		if (nbTrack == 0)
@@ -2256,6 +2572,7 @@ int SonyDb::readAllTracks()
 		nbTrackToDel = 0;
 		addTrackTotalByte = 0;
 		delTrackTotalByte = 0;
+		databaseDirty = false;
 
 		FILE *f, *f2;
 		Song *s;
@@ -2320,7 +2637,7 @@ int SonyDb::readAllTracks()
 
 		for (int index = 1; index <= obj.count; index++)
 		{
-			s = new Song();
+			s = (Song *)calloc(1, sizeof(Song));
 
 			if (getTrack(f, s))
 			{
@@ -2339,9 +2656,9 @@ int SonyDb::readAllTracks()
 				}
 
 				if (!(s->album)) s->album = strdup("");
-				if (!(s->artist)) s->album = strdup("");
-				if (!(s->genre)) s->album = strdup("");
-				if (!(s->title)) s->album = strdup("");
+				if (!(s->artist)) s->artist = strdup("");
+				if (!(s->genre)) s->genre = strdup("");
+				if (!(s->title)) s->title = strdup("");
 
 				if ((STRCMP2_NULLOK(s->album, "") == 0) && 
 						(STRCMP2_NULLOK(s->artist, "") == 0) &&
@@ -2376,7 +2693,10 @@ int SonyDb::readAllTracks()
 				s->sonyDbOrder = index;
 				lastTrackIndex++;
 				songs.push_back(*s);
+				free(s);
 			}
+			else
+				free(s);
 		}
 		fclose(f);
 		if (trackNumberAvailable)
@@ -2523,7 +2843,22 @@ void SonyDb::updateDiskSpaceInfo()
 	unsigned int totalmb = (unsigned int)((total.QuadPart)/(1024*1024));
 	commaValue(totalmb, totalDiskSpace);
 #else
-	strcpy(totalDiskSpace, "100 MB");
+	struct statvfs diskInfo;
+	if (this->getDriveLetter() && statvfs(this->getDriveLetter(), &diskInfo) == 0)
+	{
+		totalDiskSpaceValue = static_cast<__int64>(diskInfo.f_blocks) * diskInfo.f_frsize;
+		freeSpaceDisk = static_cast<__int64>(diskInfo.f_bavail) * diskInfo.f_frsize;
+		usedSpaceDisk = totalDiskSpaceValue -
+			(static_cast<__int64>(diskInfo.f_bfree) * diskInfo.f_frsize);
+		commaValue(totalDiskSpaceValue / (1024 * 1024), totalDiskSpace);
+	}
+	else
+	{
+		totalDiskSpaceValue = 0;
+		freeSpaceDisk = 0;
+		usedSpaceDisk = 0;
+		strcpy(totalDiskSpace, "Unknown");
+	}
 #endif
 }
 
@@ -2655,16 +2990,44 @@ bool SonyDb::detectPlayer()
 
 	SetErrorMode(0); //restore error mode to normal
 #else
-	char* detect_letter[] = {
-		"/media/usbdisk",
-		"/media/usbdisk1",
-		"/media/WALKMAN",
-		NULL
-	};
-	char** ptr = detect_letter;
-	while(*ptr)
-		if (detectPlayer(*ptr++))
+	// Modern desktop Linux normally mounts removable media below
+	// /media/$USER or /run/media/$USER. Keep the historical paths as
+	// fallbacks, and inspect one directory level below each mount root.
+	namespace fs = std::filesystem;
+	std::vector<fs::path> candidates;
+	candidates.push_back("/media/usbdisk");
+	candidates.push_back("/media/usbdisk1");
+	candidates.push_back("/media/WALKMAN");
+	const char *user = getenv("USER");
+	if (user && *user)
+	{
+		candidates.push_back(fs::path("/media") / user);
+		candidates.push_back(fs::path("/run/media") / user);
+	}
+	candidates.push_back("/mnt");
+
+	std::vector<fs::path> expanded = candidates;
+	for (std::vector<fs::path>::const_iterator root = candidates.begin();
+		 root != candidates.end(); ++root)
+	{
+		std::error_code error;
+		if (!fs::is_directory(*root, error))
+			continue;
+		for (fs::directory_iterator entry(*root, error), end;
+			 !error && entry != end; entry.increment(error))
+		{
+			if (entry->is_directory(error))
+				expanded.push_back(entry->path());
+		}
+	}
+
+	for (std::vector<fs::path>::const_iterator candidate = expanded.begin();
+		 candidate != expanded.end(); ++candidate)
+	{
+		std::string mountPath = candidate->string();
+		if (detectPlayer(const_cast<char *>(mountPath.c_str())))
 			return (true);
+	}
 #endif
 	return (false);
 }
@@ -2714,17 +3077,102 @@ bool SonyDb::detectPlayer(char* letter)
 
 	SetErrorMode(0); //restore error mode to normal
 #else
-	string path = letter;
+	// letter can point at driveLetter (via isPresent), so retain a copy before
+	// replacing the stored path.
+	string detectedDrive = letter;
+	string path = detectedDrive;
 	path += "/OMGAUDIO/04CNTINF.DAT";
 	if((stream = fopen(path.c_str(), "r")) != NULL)
 	{
 		fclose(stream);
-		this->driveLetter = strdup(letter);
-		sprintf(deviceName, "%s Sony Walkman", getDriveLetter());
+		if (this->driveLetter)
+			free(this->driveLetter);
+		this->driveLetter = strdup(detectedDrive.c_str());
+		snprintf(deviceName, 255, "%s Sony Walkman", getDriveLetter());
 		return (true);
 	}
 #endif
 	return (false);
+}
+
+bool SonyDb::detectPlayerStorage(char *drive)
+{
+	if (!drive || !*drive)
+		return false;
+#ifdef _WIN32
+	return detectPlayer(drive);
+#else
+	std::error_code error;
+	if (!std::filesystem::is_directory(drive, error) || access(drive, W_OK) != 0)
+		return false;
+	if (this->driveLetter)
+		free(this->driveLetter);
+	this->driveLetter = strdup(drive);
+	snprintf(deviceName, 255, "%s Sony Walkman", drive);
+	updateDiskSpaceInfo();
+	return true;
+#endif
+}
+
+bool SonyDb::detectPlayerStorage()
+{
+	if (detectPlayer())
+		return true;
+#ifdef _WIN32
+	return false;
+#else
+	// Resolve Sony's stable /dev/disk/by-id links and match them against the
+	// source device recorded for each currently mounted filesystem.
+	std::set<std::string> sonyDevices;
+	glob_t matches;
+	memset(&matches, 0, sizeof(matches));
+	if (glob("/dev/disk/by-id/usb-Sony_*Walkman*", 0, NULL, &matches) == 0)
+	{
+		for (size_t i = 0; i < matches.gl_pathc; ++i)
+		{
+			char resolved[PATH_MAX];
+			if (realpath(matches.gl_pathv[i], resolved))
+				sonyDevices.insert(resolved);
+		}
+	}
+	globfree(&matches);
+	if (sonyDevices.empty())
+		return false;
+
+	FILE *mounts = setmntent("/proc/self/mounts", "r");
+	if (!mounts)
+		return false;
+	bool found = false;
+	struct mntent *entry;
+	while (!found && (entry = getmntent(mounts)) != NULL)
+	{
+		char resolved[PATH_MAX];
+		if (realpath(entry->mnt_fsname, resolved) && sonyDevices.count(resolved))
+			found = detectPlayerStorage(entry->mnt_dir);
+	}
+	endmntent(mounts);
+	return found;
+#endif
+}
+
+bool SonyDb::initializePlayer()
+{
+	if (!getDriveLetter())
+		return false;
+#ifdef _WIN32
+	char directory[512];
+	snprintf(directory, sizeof(directory), "%s/OMGAUDIO", getDriveLetter());
+	if (!CreateDirectory(directory, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+		return false;
+#else
+	std::error_code error;
+	const std::filesystem::path directory =
+		std::filesystem::path(getDriveLetter()) / "OMGAUDIO";
+	if (!std::filesystem::create_directory(directory, error) && error)
+		return false;
+#endif
+	databaseDirty = true;
+	return writeTracks();
 }
 
 //get real file name from id number
@@ -2792,7 +3240,7 @@ bool SonyDb::write_00GTRLST()
 	Opointer.length = UINT32_SWAP_BE_LE(0x0AB0);
 	writeObjectPointer(&Opointer, f);
 
-	uint8 t[16];
+	std::uint8_t t[16];
 	for (int i = 0; i < 16; i++)
 		t[i] = 0;
 
@@ -2807,12 +3255,12 @@ bool SonyDb::write_00GTRLST()
 	obj.padding[1] = 0;
 	writeObject(&obj, f);
 
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 
 	//write the GTLB object header
 	obj.magic[0] = 'G';
@@ -2830,95 +3278,95 @@ bool SonyDb::write_00GTRLST()
 	//first block
 	t[1] = 0x01;
 	t[3] = 0x01;
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[3] = 0;
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0;
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 
 	//2nd
 	t[1] = 0x02;
 	t[3] = 0x03;
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0x01;
 	t[3] = 0;
 	t[4] = 'T';
 	t[5] = 'P';
 	t[6] = 'E';
 	t[7] = '1';
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0;
 	t[4] = 0;
 	t[5] = 0;
 	t[6] = 0;
 	t[7] = 0;
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 
 	//3rd
 	t[1] = 0x03;
 	t[3] = 0x03;
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0x01;
 	t[3] = 0;
 	t[4] = 'T';
 	t[5] = 'A';
 	t[6] = 'L';
 	t[7] = 'B';
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0;
 	t[4] = 0;
 	t[5] = 0;
 	t[6] = 0;
 	t[7] = 0;
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 
 
 	//4th
 	t[1] = 0x04;
 	t[3] = 0x03;
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0x01;
 	t[3] = 0;
 	t[4] = 'T';
 	t[5] = 'C';
 	t[6] = 'O';
 	t[7] = 'N';
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0;
 	t[4] = 0;
 	t[5] = 0;
 	t[6] = 0;
 	t[7] = 0;
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 
 	//5th
 	t[1] = 0x22;
 	t[3] = 0x02;
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 	t[1] = 0;
 	t[3] = 0;
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
-	fwrite(&t, sizeof(uint8), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
+	fwrite(&t, sizeof(std::uint8_t), 16, f);
 
 	for (int j = 5; j < 34 ; j++)
 	{
-		t[1] = (uint8) j;
-		fwrite(&t, sizeof(uint8), 16, f);
+		t[1] = (std::uint8_t) j;
+		fwrite(&t, sizeof(std::uint8_t), 16, f);
 		t[1] = 0;
-		fwrite(&t, sizeof(uint8), 16, f);
-		fwrite(&t, sizeof(uint8), 16, f);
-		fwrite(&t, sizeof(uint8), 16, f);
-		fwrite(&t, sizeof(uint8), 16, f);
+		fwrite(&t, sizeof(std::uint8_t), 16, f);
+		fwrite(&t, sizeof(std::uint8_t), 16, f);
+		fwrite(&t, sizeof(std::uint8_t), 16, f);
+		fwrite(&t, sizeof(std::uint8_t), 16, f);
 	}
 
 	fclose(f);
@@ -2996,10 +3444,10 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 	writeObject(&obj, f);
 
 	//write the GPLB object
-	uint16 index1 = 0;
-	uint16 cte1 = UINT16_SWAP_BE_LE(0x0100);
-	uint16 index2;
-	uint16 cte2 = 0x0000;
+	std::uint16_t index1 = 0;
+	std::uint16_t cte1 = UINT16_SWAP_BE_LE(0x0100);
+	std::uint16_t index2;
+	std::uint16_t cte2 = 0x0000;
 
 	int index = 1;
 	int indexTPLB = 1;
@@ -3020,10 +3468,10 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 	{
 		index1 = UINT16_SWAP_BE_LE(index); index++; //fucking side effect :-P
 		index2 = UINT16_SWAP_BE_LE(indexTPLB);
-		fwrite(&index1, sizeof(uint16), 1, f);
-		fwrite(&cte1, sizeof(uint16), 1, f);
-		fwrite(&index2, sizeof(uint16), 1, f);
-		fwrite(&cte2, sizeof(uint16), 1, f);
+		fwrite(&index1, sizeof(std::uint16_t), 1, f);
+		fwrite(&cte1, sizeof(std::uint16_t), 1, f);
+		fwrite(&index2, sizeof(std::uint16_t), 1, f);
+		fwrite(&cte2, sizeof(std::uint16_t), 1, f);
 		indexTPLB += (nbSongs / 2);
 	}
 
@@ -3042,10 +3490,10 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 
 		index1 = UINT16_SWAP_BE_LE(index); index++; //fucking side effect :-P
 		index2 = UINT16_SWAP_BE_LE(indexTPLB);
-		fwrite(&index1, sizeof(uint16), 1, f);
-		fwrite(&cte1, sizeof(uint16), 1, f);
-		fwrite(&index2, sizeof(uint16), 1, f);
-		fwrite(&cte2, sizeof(uint16), 1, f);
+		fwrite(&index1, sizeof(std::uint16_t), 1, f);
+		fwrite(&cte1, sizeof(std::uint16_t), 1, f);
+		fwrite(&index2, sizeof(std::uint16_t), 1, f);
+		fwrite(&cte2, sizeof(std::uint16_t), 1, f);
 
 		//find the next TPLB index
 
@@ -3106,9 +3554,9 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 	//fill the rest with zeros 
 	index--;
 	int last = (16384 - (index * 8));
-	uint8 cte3 = 0;
+	std::uint8_t cte3 = 0;
 	for (int i = 0; i < last; i++)
-		fwrite(&cte3, sizeof(uint8), 1, f);
+		fwrite(&cte3, sizeof(std::uint8_t), 1, f);
 
 	//write the TPLB object header
 	memcpy( obj.magic, "TPLB", 4 );
@@ -3132,7 +3580,7 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 			index++;
 			index1 = UINT16_SWAP_BE_LE((*song)->sonyDbOrder);
 			//fprintf(fp, "%i ", (*song)->sonyDbOrder);//debug
-			fwrite(&index1, sizeof(uint16), 1, f);
+			fwrite(&index1, sizeof(std::uint16_t), 1, f);
 		}
 	}
 
@@ -3145,7 +3593,7 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 		index++;
 		index1 = UINT16_SWAP_BE_LE((*song)->sonyDbOrder);
 		//fprintf(fp, "%i ", (*song)->sonyDbOrder);//debug
-		fwrite(&index1, sizeof(uint16), 1, f);
+		fwrite(&index1, sizeof(std::uint16_t), 1, f);
 	}
 	//fprintf(fp, "\n\n");//debug
 
@@ -3153,7 +3601,7 @@ bool SonyDb::write_01TREEXX(vector<Song *> songs, vector<Song *> list, int type)
 	index1 = 0;
 	while (index % 8 != 0)
 	{
-		fwrite(&index1, sizeof(uint16), 1, f);
+		fwrite(&index1, sizeof(std::uint16_t), 1, f);
 		index++;
 	}
 
@@ -3458,7 +3906,7 @@ bool SonyDb::write_03GINFXX(vector<Song *> list, int type)
 				return (false);
 
 			//picp tag
-			memcpy( tt.tagType, "", 4 );
+			memset(tt.tagType, 0, sizeof(tt.tagType));
 			if (!(writeTrackTag(&tt, "", f)))
 				return (false);
 
@@ -3543,7 +3991,7 @@ bool SonyDb::write_04CNTINF(vector<Song *> songsToSend)
 
 	for (vector<Song *>::iterator i = songsToSend.begin(); i != songsToSend.end(); i++)
 	{
-		t.trackEncoding = (*i)->encoding;
+		t.trackEncoding = UINT32_SWAP_BE_LE((*i)->encoding);
 		t.trackLength = UINT32_SWAP_BE_LE((*i)->songlen * 1000);
 
 
@@ -3616,8 +4064,8 @@ bool SonyDb::write_05CIDLST(vector<Song *> songsToSend)
 	obj.padding[1] = 0;
 	writeObject(&obj, f);
 
-	uint8 t[16];
-	uint8 tt[32];
+	std::uint8_t t[16];
+	std::uint8_t tt[32];
 
 	t[0] = 0; //WWWWTTTTFFFFFF??????
 	t[1] = 0;
@@ -3733,76 +4181,39 @@ bool SonyDb::write_TrackNumber(vector<Song *> songsToSend)
 /* TOOLS */
 utf16char *ansi_to_utf16(const char  *str, long len, bool endian)
 {
+	if (len <= 0) return NULL;
+	utf16char *dest = (utf16char*)calloc(static_cast<size_t>(len), sizeof(utf16char));
+	if (!dest || !str) return dest;
 
-	utf16char *dest=(utf16char*)malloc(sizeof(utf16char) * len);
-	memset(dest, 0, sizeof(utf16char) * len);
-
-	int j;
-	for (j = 0; j < len; j++)
-		dest[j] = 0;
-
-	if(!str) return dest; //Return an empty buffer of the size needed
-
-	wchar_t *wdest=(wchar_t*)malloc(sizeof(wchar_t) * (len+1));
-	memset(wdest, 0, sizeof(wchar_t)*len);
-
-#ifdef _WIN32
-	int num = MultiByteToWideChar(CP_ACP,0,str,-1,(WCHAR*)wdest,strlen(str)+1);
-#else
-	mbstowcs(wdest, str, 2048);
-#endif
-
-	for (j = 0; j < len; j++)
-	{
-		if (wdest[j] != 0)
-			dest[j] = wdest[j];
-		else
-			dest[j] = 0;
-	}
-	free(wdest);
-
-	//endianness
-	if (endian)
-	{
-		for (int i = 0; i < len; i++)
-			dest[i] = UINT16_SWAP_BE_LE(dest[i]);
+	const std::u16string converted = utf8_to_utf16_string(str);
+	size_t count = std::min(converted.size(), static_cast<size_t>(len - 1));
+	if (count < converted.size() && count > 0
+		&& converted[count - 1] >= 0xd800 && converted[count - 1] <= 0xdbff)
+		--count;
+	for (size_t i = 0; i < count; ++i) {
+		utf16char value = static_cast<utf16char>(converted[i]);
+		dest[i] = endian ? UINT16_SWAP_BE_LE(value) : value;
 	}
 	return dest;
 }
 
 char *utf16_to_ansi(const utf16char *str, long len, bool endian)
 {
-	if(!str) return NULL;
-	char dest[2048]="";
-	char * d=dest;
-
-	wchar_t *src = (wchar_t*)malloc(sizeof(wchar_t) * (len+1));
-	memset(src, 0, sizeof(wchar_t) * (len+1));
-
-	for (int j = 0; j < len; j++)
-	{
-		if (str[j] != 0)
-			src[j] = str[j];
-		else
-			src[j] = 0;
+	if (!str || len <= 0) return NULL;
+	std::u16string converted;
+	converted.reserve(static_cast<size_t>(len));
+	for (long i = 0; i < len; ++i) {
+		utf16char value = endian ? UINT16_SWAP_BE_LE(str[i]) : str[i];
+		if (value == 0) break;
+		converted.push_back(static_cast<char16_t>(value));
 	}
-
-	//endianness
-	if (endian)
-	{
-		for (int i = 0; i < len; i++)
-			src[i] = UINT16_SWAP_BE_LE(src[i]);
+	try {
+		std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
+		const std::string utf8 = converter.to_bytes(converted);
+		return strdup(utf8.c_str());
+	} catch (const std::range_error &) {
+		return strdup("");
 	}
-	memset(d, 0, 2048);
-
-#ifdef _WIN32
-	WideCharToMultiByte(CP_ACP,0,(WCHAR*)src,-1,d,sizeof(dest)-1,NULL,NULL);
-#else
-	wcstombs(d, src, 2048);
-#endif
-
-	dest[2047]=0;
-	return strdup(dest);
 }
 
 
