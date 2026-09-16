@@ -1,21 +1,26 @@
 # SonyDb GUI
 
-SonyDb GUI is a C++/Qt 6 application for importing audio CDs and transferring
-MP3 files between Ubuntu and legacy Sony Walkman players. It uses the
+SonyDb GUI is a C++/Qt 6 application for importing audio CDs, managing a local
+audio library, and transferring music between Ubuntu and legacy Sony Walkman
+players. It uses the
 OpenMG/OMA database support from `mattn/sonydb` and does not use Python.
 
-Audio CDs are read directly from the Linux optical-drive interface, encoded as
-MP3 by FFmpeg at a selectable bitrate, and tagged with album and track metadata
-from MusicBrainz. MusicBrainz is one of the world's largest open music metadata
-databases and supports CD table-of-contents matching without an API key.
+Audio CDs are read directly from the Linux optical-drive interface and encoded
+as MP3, FLAC, or Ogg Vorbis by FFmpeg. Album and track metadata comes from
+MusicBrainz, one of the world's largest open music metadata databases, using CD
+table-of-contents matching without an API key.
 
 ## Source layout
 
 ```text
 .
 ├── gui_main.cpp       # Qt GUI for SonyDb
-├── cd_importer.*      # Linux CD-DA, MusicBrainz, and MP3 import service
+├── cd_importer.*      # Linux CD-DA, MusicBrainz, and audio import service
+├── local_audio.*      # Local format detection and metadata probing
+├── encoded_audio_importer.* # Shared encoded-audio import path
+├── library_path.h     # Unicode-normalized library paths
 ├── id3_metadata.*     # Locale-independent ID3 Unicode decoder
+├── scripts/           # Debian package and AppImage build helpers
 ├── CMakeLists.txt     # Top-level project, including the GUI
 └── sonydb/            # Mattn's sonydb transfer engine and CLI
     ├── sonydb.cpp
@@ -58,6 +63,16 @@ cmake --build --preset release -j
 sudo cmake --install build/release
 ```
 
+To produce an installable Debian package or standalone AppImage:
+
+```sh
+./scripts/build-deb.sh
+./scripts/build-appimage.sh
+```
+
+Package output is written under `dist/`. The Debian package declares its
+runtime dependencies so APT can resolve them during installation.
+
 ## Usage
 
 1. Use **Music Folder** in the top toolbar to select the PC music library and CD
@@ -65,19 +80,24 @@ sudo cmake --install build/release
 2. Insert an audio CD and click **Refresh CD**. The application obtains album,
    track, date, album-artist, and per-track artist metadata from MusicBrainz.
    Select the correct release when more than one edition matches the disc.
-3. Open **MP3 Settings** to choose CBR (128–320 kbps) or VBR (V0–V5), Joint
-   Stereo/Stereo/Mono, and the encoder quality. The source sample format remains
-   the CD-native 44.1 kHz/16-bit format, and the settings are remembered.
+3. Open **Settings**, then **Audio Encoding Settings**, and choose MP3, FLAC, or
+   Ogg Vorbis. MP3 supports CBR (128–320 kbps), VBR (V0–V5), channel mode, and
+   encoder quality. FLAC supports compression levels 0–12, and Ogg Vorbis
+   supports quality levels 0–10. The settings are remembered.
 4. Select tracks in the **Audio CD** pane and click the right-arrow **Import**
    button. Files are written as
-   `Album Artist/Album/Track Number - Title.mp3`, with ID3v2 metadata. Compilation
+   `Album Artist/Album/Track Number - Title.extension`, with format-native metadata. Compilation
    albums keep each track artist and normally use `Various Artists` as the album
    folder.
 5. Connect the Walkman over USB and mount it in Ubuntu.
 6. Select **Auto Detect**. If the device is not found, use **Select Walkman** to
    choose its mount point manually.
-7. Select MP3 files or folders in the PC tree and click the center right arrow
-   to transfer them to the Walkman.
+   Early OpenMG models such as the NW-E405 also require their device-specific
+   `DvID.dat`; select it under **Settings > Walkman Security** when requested.
+7. Select supported audio files or folders in the PC tree and click the center
+   right arrow to transfer them to the Walkman. Compatible MP3 files are copied
+   without re-encoding; other formats are temporarily converted using the
+   Walkman MP3 settings.
 8. Use **By Album**, **By Artist**, **By Genre**, or **Ungrouped** to change the
    device list view.
 9. To restore music from the Walkman, select a destination folder on the PC,
@@ -104,11 +124,13 @@ and each pane remembers its header layout for the next launch.
 
 ## Transfer quality and text encoding
 
-Transferring an MP3 to the Walkman does not re-encode its audio. SonyDb wraps
+Transferring a compatible MP3 to the Walkman does not re-encode its audio. SonyDb wraps
 the original MP3 frames in the device-required OMA container, so the bitrate,
 VBR/CBR mode, sample rate, and audible quality remain unchanged. For CD imports,
 the quality selected under **MP3 Settings** therefore becomes the Walkman copy's
-quality as well. CBR 192 or 256 kbps is a practical compatibility-oriented
+quality as well. FLAC, Ogg Vorbis, Opus, M4A/AAC, WAV, and WMA files remain
+unchanged in the PC library and are converted to a temporary Walkman-compatible
+MP3 only during transfer. CBR 192 or 256 kbps is a practical compatibility-oriented
 choice; CBR 320 kbps or VBR V0 provides the highest quality offered by the
 application at a larger file size.
 
@@ -120,6 +142,15 @@ id3lib's byte-ordered UTF-16 buffers and stops at the real string terminator
 instead of treating the field capacity as its text length. Tracks written by an older
 build with already-corrupted metadata must be removed and transferred again;
 the lost text cannot be reconstructed from the corrupted device database.
+
+PC library path components are normalized with Unicode NFKC plus consistent
+apostrophes, quotation marks, dashes, wave marks, and whitespace. Imports reuse
+equivalent existing artist and album directories. Existing folders can be
+normalized without overwriting colliding files:
+
+```sh
+./build/default/sonydb-normalize-library "$HOME/Music"
+```
 
 CD metadata lookup requires an internet connection. CD extraction also requires
 read permission for the optical drive (normally `/dev/sr0`); Ubuntu desktop
@@ -141,8 +172,8 @@ Transfers, edits, and removals are applied to the device only after
 confirmation. Do not disconnect the USB cable while an operation is running.
 Use Ubuntu's eject or unmount action before physically disconnecting the
 Walkman.
-Selecting an artist or album folder on the PC recursively transfers the MP3
-files below it. The physical files on the Walkman use the device-required
+Selecting an artist or album folder on the PC recursively transfers supported
+audio files below it. The physical files on the Walkman use the device-required
 `OMGAUDIO` layout, while artist and album classifications are preserved as
 track metadata in the SonyDb database.
 
@@ -154,6 +185,20 @@ Before a transfer, `OMGAUDIO/*.DAT` is automatically backed up under
 `~/.local/share/SonyDb/SonyDb GUI/backups/`. The original command-line program
 is still built as `./build/default/sonydb/sonydb-cli`. To set the mount point
 explicitly, use `SONYDB_PLAYERPATH=/media/$USER/WALKMAN`.
+
+## OpenMG device keys and MG ERROR
+
+Some early Network Walkman models require MP3 payload encryption using a key
+derived from that physical device's `DvID.dat`. SonyDb detects these databases,
+searches common device and MP3 File Manager locations for the key, preserves
+existing protection records, and blocks a protected transfer before changing
+the device when no valid key is available.
+
+If an older SonyDb build created unprotected tracks that report **MG ERROR**,
+load the correct key under **Settings > Walkman Security** and use **Repair
+Existing MG ERROR Tracks**. A database backup is created before repair.
+`DvID.dat` is device-specific and must not be invented or copied from another
+player.
 
 ## Format limitations
 

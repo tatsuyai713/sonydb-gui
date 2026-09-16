@@ -1,5 +1,8 @@
 # CMake out-of-source builds
 build/
+dist/
+*.AppImage
+**/target/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/

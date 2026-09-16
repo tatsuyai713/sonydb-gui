@@ -3,6 +3,6 @@ Type=Application
 Name=SonyDb GUI
 Comment=Transfer music to legacy Sony Walkman players
 Exec=sonydb-gui
-Icon=multimedia-player
+Icon=sonydb-gui
 Terminal=false
 Categories=AudioVideo;Audio;Utility;

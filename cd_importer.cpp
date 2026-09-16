@@ -1,4 +1,5 @@
 #include "cd_importer.h"
+#include "library_path.h"
 
 #include <QDir>
 #include <QFile>
@@ -40,18 +41,6 @@ QString artistCredit(const QJsonArray &credit)
     return value.trimmed();
 }
 
-QString safePathPart(QString value, const QString &fallback)
-{
-    value = value.trimmed();
-    for (QChar &character : value) {
-        if (character == QLatin1Char('/') || character == QLatin1Char('\\')
-            || character.unicode() < 0x20) character = QLatin1Char('_');
-    }
-    while (value.endsWith(QLatin1Char('.')) || value.endsWith(QLatin1Char(' '))) value.chop(1);
-    if (value.isEmpty() || value == QStringLiteral(".") || value == QStringLiteral("..")) return fallback;
-    return value;
-}
-
 QString tocString(const CdDiscInfo &disc)
 {
     if (disc.tracks.isEmpty()) return {};
@@ -75,13 +64,31 @@ QString CdMetadataCandidate::displayName() const
 
 QString Mp3EncodingSettings::summary() const
 {
+    if (format == Format::Flac)
+        return QStringLiteral("FLAC · compression %1 · 44.1 kHz/16-bit").arg(flacCompression);
+    if (format == Format::OggVorbis)
+        return QStringLiteral("Ogg Vorbis · quality %1 · 44.1 kHz").arg(oggQuality);
     const QString rate = rateMode == RateMode::ConstantBitrate
         ? QStringLiteral("CBR %1 kbps").arg(bitrateKbps)
         : QStringLiteral("VBR V%1").arg(vbrQuality);
     QString channels = QStringLiteral("Joint Stereo");
     if (channelMode == ChannelMode::Stereo) channels = QStringLiteral("Stereo");
     else if (channelMode == ChannelMode::Mono) channels = QStringLiteral("Mono");
-    return QStringLiteral("%1 · %2 · 44.1 kHz").arg(rate, channels);
+    return QStringLiteral("MP3 · %1 · %2 · 44.1 kHz").arg(rate, channels);
+}
+
+QString Mp3EncodingSettings::extension() const
+{
+    if (format == Format::Flac) return QStringLiteral("flac");
+    if (format == Format::OggVorbis) return QStringLiteral("ogg");
+    return QStringLiteral("mp3");
+}
+
+QString Mp3EncodingSettings::formatName() const
+{
+    if (format == Format::Flac) return QStringLiteral("FLAC");
+    if (format == Format::OggVorbis) return QStringLiteral("Ogg Vorbis");
+    return QStringLiteral("MP3");
 }
 
 QString CdImporter::pcmSampleFormat()
@@ -251,18 +258,77 @@ void CdImporter::applyMetadata(CdDiscInfo *disc, const CdMetadataCandidate &cand
 QString CdImporter::outputPath(const CdDiscInfo &disc, const CdTrackInfo &track,
                                const QString &musicFolder)
 {
-    const QString artist = safePathPart(disc.albumArtist, QStringLiteral("Unknown Artist"));
-    const QString album = safePathPart(disc.album, QStringLiteral("Unknown Album"));
-    const QString title = safePathPart(track.title, QStringLiteral("Track %1").arg(track.number));
-    return QDir(musicFolder).filePath(QStringLiteral("%1/%2/%3 - %4.mp3")
-        .arg(artist, album, QString::number(track.number).rightJustified(2, QLatin1Char('0')), title));
+    return outputPath(disc, track, musicFolder, Mp3EncodingSettings{});
+}
+
+QString CdImporter::outputPath(const CdDiscInfo &disc, const CdTrackInfo &track,
+                               const QString &musicFolder, const Mp3EncodingSettings &settings)
+{
+    const QString artistPart = LibraryPath::safePart(disc.albumArtist, QStringLiteral("Unknown Artist"));
+    const QString artist = LibraryPath::existingDirectoryName(musicFolder, artistPart);
+    const QString artistPath = QDir(musicFolder).filePath(artist);
+    const QString albumPart = LibraryPath::safePart(disc.album, QStringLiteral("Unknown Album"));
+    const QString album = LibraryPath::existingDirectoryName(artistPath, albumPart);
+    const QString title = LibraryPath::safePart(track.title, QStringLiteral("Track %1").arg(track.number));
+    const QString albumPath = QDir(artistPath).filePath(album);
+    const QString filename = LibraryPath::existingFileName(albumPath,
+        QStringLiteral("%1 - %2.%3")
+            .arg(QString::number(track.number).rightJustified(2, QLatin1Char('0')), title,
+                 settings.extension()));
+    return QDir(albumPath).filePath(filename);
+}
+
+QStringList CdImporter::encodingArguments(const CdDiscInfo &disc, const CdTrackInfo &track,
+                                          const Mp3EncodingSettings &settings,
+                                          const QString &outputFile)
+{
+    // Linux CDROMREADAUDIO supplies host-order samples. A wrong byte order
+    // swaps every 16-bit sample into full-scale noise.
+    QStringList arguments{QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"),
+        QStringLiteral("-f"), pcmSampleFormat(), QStringLiteral("-ar"), QStringLiteral("44100"),
+        QStringLiteral("-ac"), QStringLiteral("2"), QStringLiteral("-i"), QStringLiteral("pipe:0"),
+        QStringLiteral("-map_metadata"), QStringLiteral("-1")};
+    if (settings.format == Mp3EncodingSettings::Format::Mp3) {
+        arguments << QStringLiteral("-codec:a") << QStringLiteral("libmp3lame");
+        if (settings.rateMode == Mp3EncodingSettings::RateMode::ConstantBitrate)
+            arguments << QStringLiteral("-b:a") << QStringLiteral("%1k").arg(settings.bitrateKbps);
+        else
+            arguments << QStringLiteral("-q:a") << QString::number(settings.vbrQuality);
+        arguments << QStringLiteral("-compression_level") << QString::number(settings.encoderQuality);
+    } else if (settings.format == Mp3EncodingSettings::Format::Flac) {
+        arguments << QStringLiteral("-codec:a") << QStringLiteral("flac")
+                  << QStringLiteral("-compression_level") << QString::number(settings.flacCompression);
+    } else {
+        arguments << QStringLiteral("-codec:a") << QStringLiteral("libvorbis")
+                  << QStringLiteral("-q:a") << QString::number(settings.oggQuality);
+    }
+    if (settings.format != Mp3EncodingSettings::Format::Flac
+        && settings.channelMode == Mp3EncodingSettings::ChannelMode::Mono)
+        arguments << QStringLiteral("-ac") << QStringLiteral("1");
+    else if (settings.format == Mp3EncodingSettings::Format::Mp3)
+        arguments << QStringLiteral("-joint_stereo")
+                  << (settings.channelMode == Mp3EncodingSettings::ChannelMode::JointStereo
+                      ? QStringLiteral("1") : QStringLiteral("0"));
+    if (settings.format == Mp3EncodingSettings::Format::Mp3)
+        arguments << QStringLiteral("-id3v2_version") << QStringLiteral("3");
+    arguments << QStringLiteral("-metadata") << QStringLiteral("title=%1").arg(track.title)
+              << QStringLiteral("-metadata") << QStringLiteral("artist=%1").arg(track.artist)
+              << QStringLiteral("-metadata") << QStringLiteral("album=%1").arg(disc.album)
+              << QStringLiteral("-metadata") << QStringLiteral("album_artist=%1").arg(disc.albumArtist)
+              << QStringLiteral("-metadata") << QStringLiteral("track=%1/%2").arg(track.number).arg(disc.tracks.size());
+    if (disc.year > 0) arguments << QStringLiteral("-metadata") << QStringLiteral("date=%1").arg(disc.year);
+    const QString muxer = settings.format == Mp3EncodingSettings::Format::Flac
+        ? QStringLiteral("flac") : settings.format == Mp3EncodingSettings::Format::OggVorbis
+        ? QStringLiteral("ogg") : QStringLiteral("mp3");
+    arguments << QStringLiteral("-f") << muxer << outputFile;
+    return arguments;
 }
 
 CdRipResult CdImporter::ripTrack(const CdDiscInfo &disc, const CdTrackInfo &track,
                                  const QString &musicFolder, const Mp3EncodingSettings &settings,
                                  bool overwrite, QString *outputFile, QString *error)
 {
-    const QString output = outputPath(disc, track, musicFolder);
+    const QString output = outputPath(disc, track, musicFolder, settings);
     if (outputFile) *outputFile = output;
     if (QFileInfo::exists(output) && !overwrite) return CdRipResult::AlreadyExists;
     if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty()) {
@@ -276,31 +342,7 @@ CdRipResult CdImporter::ripTrack(const CdDiscInfo &disc, const CdTrackInfo &trac
 
     const QString temporary = output + QStringLiteral(".sonydb-part");
     QFile::remove(temporary);
-    // Linux CDROMREADAUDIO supplies host-order samples. A wrong byte order
-    // swaps every 16-bit sample into full-scale noise.
-    QStringList arguments{QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"),
-        QStringLiteral("-f"), pcmSampleFormat(), QStringLiteral("-ar"), QStringLiteral("44100"),
-        QStringLiteral("-ac"), QStringLiteral("2"), QStringLiteral("-i"), QStringLiteral("pipe:0"),
-        QStringLiteral("-map_metadata"), QStringLiteral("-1"), QStringLiteral("-codec:a"), QStringLiteral("libmp3lame")};
-    if (settings.rateMode == Mp3EncodingSettings::RateMode::ConstantBitrate)
-        arguments << QStringLiteral("-b:a") << QStringLiteral("%1k").arg(settings.bitrateKbps);
-    else
-        arguments << QStringLiteral("-q:a") << QString::number(settings.vbrQuality);
-    arguments << QStringLiteral("-compression_level") << QString::number(settings.encoderQuality);
-    if (settings.channelMode == Mp3EncodingSettings::ChannelMode::Mono)
-        arguments << QStringLiteral("-ac") << QStringLiteral("1");
-    else
-        arguments << QStringLiteral("-joint_stereo")
-                  << (settings.channelMode == Mp3EncodingSettings::ChannelMode::JointStereo
-                      ? QStringLiteral("1") : QStringLiteral("0"));
-    arguments << QStringLiteral("-id3v2_version") << QStringLiteral("3")
-              << QStringLiteral("-metadata") << QStringLiteral("title=%1").arg(track.title)
-              << QStringLiteral("-metadata") << QStringLiteral("artist=%1").arg(track.artist)
-              << QStringLiteral("-metadata") << QStringLiteral("album=%1").arg(disc.album)
-              << QStringLiteral("-metadata") << QStringLiteral("album_artist=%1").arg(disc.albumArtist)
-              << QStringLiteral("-metadata") << QStringLiteral("track=%1/%2").arg(track.number).arg(disc.tracks.size());
-    if (disc.year > 0) arguments << QStringLiteral("-metadata") << QStringLiteral("date=%1").arg(disc.year);
-    arguments << QStringLiteral("-f") << QStringLiteral("mp3") << temporary;
+    const QStringList arguments = encodingArguments(disc, track, settings, temporary);
 
     QProcess encoder;
     encoder.setProgram(QStringLiteral("ffmpeg"));

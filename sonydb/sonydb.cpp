@@ -66,6 +66,93 @@ static std::u16string utf8_to_utf16_string(const char *text)
 	}
 }
 
+static std::uint16_t oma_protection(const char *fileName)
+{
+	if (!fileName || !*fileName) return SONY_PROTECTION_NONE;
+	FILE *file = fopen(fileName, "rb");
+	if (!file) return SONY_PROTECTION_NONE;
+	std::uint8_t header[10];
+	if (fread(header, 1, sizeof(header), file) != sizeof(header) || memcmp(header, "ea3", 3) != 0)
+	{
+		fclose(file);
+		return SONY_PROTECTION_NONE;
+	}
+	const long metadataSize = ((header[6] & 0x7f) << 21) | ((header[7] & 0x7f) << 14) |
+		((header[8] & 0x7f) << 7) | (header[9] & 0x7f);
+	std::uint8_t format[8];
+	const bool valid = fseek(file, 10 + metadataSize, SEEK_SET) == 0 &&
+		fread(format, 1, sizeof(format), file) == sizeof(format) && memcmp(format, "EA3", 3) == 0;
+	fclose(file);
+	return valid ? static_cast<std::uint16_t>((format[6] << 8) | format[7]) : SONY_PROTECTION_NONE;
+}
+
+static bool encrypt_unprotected_oma(const char *fileName, int trackId, std::uint32_t deviceId)
+{
+	FILE *input = fopen(fileName, "rb");
+	if (!input) return false;
+	std::uint8_t metadata[10];
+	if (fread(metadata, 1, sizeof(metadata), input) != sizeof(metadata) ||
+		memcmp(metadata, "ea3", 3) != 0)
+	{
+		fclose(input);
+		return false;
+	}
+	const long metadataSize = ((metadata[6] & 0x7f) << 21) | ((metadata[7] & 0x7f) << 14) |
+		((metadata[8] & 0x7f) << 7) | (metadata[9] & 0x7f);
+	const long formatOffset = 10 + metadataSize;
+	std::uint8_t format[96];
+	if (fseek(input, formatOffset, SEEK_SET) != 0 ||
+		fread(format, 1, sizeof(format), input) != sizeof(format) ||
+		memcmp(format, "EA3", 3) != 0 || format[32] != 0x03 ||
+		format[6] != 0xff || format[7] != 0xff)
+	{
+		fclose(input);
+		return false;
+	}
+	const long audioOffset = formatOffset + static_cast<long>(sizeof(format));
+	if (fseek(input, 0, SEEK_SET) != 0) { fclose(input); return false; }
+	const string temporary = string(fileName) + ".sonydb-encrypt";
+	const string original = string(fileName) + ".sonydb-clear-backup";
+	FILE *output = fopen(temporary.c_str(), "wb");
+	if (!output) { fclose(input); return false; }
+	const std::uint32_t key = (0x2465U + static_cast<std::uint32_t>(trackId) * 0x5296E435U) ^ deviceId;
+	std::uint8_t buffer[32768];
+	long absolutePosition = 0;
+	long audioPosition = 0;
+	bool success = true;
+	while (success)
+	{
+		const size_t count = fread(buffer, 1, sizeof(buffer), input);
+		if (count == 0) break;
+		for (size_t index = 0; index < count; ++index, ++absolutePosition)
+		{
+			if (absolutePosition == formatOffset + 6) buffer[index] = 0xff;
+			else if (absolutePosition == formatOffset + 7) buffer[index] = 0xfe;
+			else if (absolutePosition >= audioOffset)
+			{
+				const int shift = 24 - static_cast<int>((audioPosition % 4) * 8);
+				buffer[index] ^= static_cast<std::uint8_t>((key >> shift) & 0xff);
+				++audioPosition;
+			}
+		}
+		success = fwrite(buffer, 1, count, output) == count;
+	}
+	if (ferror(input)) success = false;
+	success = fclose(output) == 0 && success;
+	fclose(input);
+	if (!success) { remove(temporary.c_str()); return false; }
+	remove(original.c_str());
+	if (rename(fileName, original.c_str()) != 0) { remove(temporary.c_str()); return false; }
+	if (rename(temporary.c_str(), fileName) != 0)
+	{
+		rename(original.c_str(), fileName);
+		remove(temporary.c_str());
+		return false;
+	}
+	remove(original.c_str());
+	return true;
+}
+
 
 
 SonyDb::SonyDb()
@@ -77,6 +164,9 @@ SonyDb::SonyDb()
 	this->nbTrackToDel = 0;
 	this->lastTrackIndex = 1;
 	this->codeType = ENCODING_USE_NONE;
+	this->decodeTableFilename = 0;
+	this->DvId = 0;
+	this->deviceKeyRequired = false;
 	this->copying = false;
 	this->databaseDirty = false;
 	this->copyIndex = 0;
@@ -124,6 +214,7 @@ SonyDb::~SonyDb()
 	//fclose(fp);
 
 	if (driveLetter) free(driveLetter);
+	if (decodeTableFilename) free(decodeTableFilename);
 }
 
 //free track list
@@ -236,6 +327,10 @@ vector<Song*> SonyDb::getSongsInPlaylist(int source)
 					p->year = (*i)->year;
 					p->statusOfSong = (*i)->statusOfSong;
 					p->sonyDbOrder = (*i)->sonyDbOrder;
+					p->encoding = (*i)->encoding;
+					p->protection = (*i)->protection;
+					p->hasCidRecord = (*i)->hasCidRecord;
+					memcpy(p->cidRecord, (*i)->cidRecord, sizeof(p->cidRecord));
 					ret.push_back(p);
 				}
 			}
@@ -269,6 +364,10 @@ vector<Song*> SonyDb::getSongsInPlaylist(int source)
 					p->year = (*i)->year;
 					p->statusOfSong = (*i)->statusOfSong;
 					p->sonyDbOrder = (*i)->sonyDbOrder;
+					p->encoding = (*i)->encoding;
+					p->protection = (*i)->protection;
+					p->hasCidRecord = (*i)->hasCidRecord;
+					memcpy(p->cidRecord, (*i)->cidRecord, sizeof(p->cidRecord));
 					ret.push_back(p);
 				}
 			}
@@ -328,6 +427,10 @@ vector<Song*> SonyDb::getSongs()
 				p->year = (*i).year;
 				p->statusOfSong = (*i).statusOfSong;
 				p->sonyDbOrder = (*i).sonyDbOrder;
+				p->encoding = (*i).encoding;
+				p->protection = (*i).protection;
+				p->hasCidRecord = (*i).hasCidRecord;
+				memcpy(p->cidRecord, (*i).cidRecord, sizeof(p->cidRecord));
 				ret.push_back(p);
 			}
 		}
@@ -351,6 +454,10 @@ vector<Song*> SonyDb::getSongs()
 				p->year = (*i).year;
 				p->statusOfSong = (*i).statusOfSong;
 				p->sonyDbOrder = (*i).sonyDbOrder;
+				p->encoding = (*i).encoding;
+				p->protection = (*i).protection;
+				p->hasCidRecord = (*i).hasCidRecord;
+				memcpy(p->cidRecord, (*i).cidRecord, sizeof(p->cidRecord));
 				ret.push_back(p);
 			}
 		}
@@ -794,17 +901,98 @@ bool SonyDb::writeTrackTag(sonyTrackTag *tt, char *input, FILE *f)
 
 void SonyDb::setTable(char *TableFileName, int type)
 {
-	this->decodeTableFilename = strdup(TableFileName);
-	this->codeType = type;
-
 	if (type == ENCODING_USE_KEY)
+		setDeviceKeyFile(TableFileName);
+	else if (TableFileName && *TableFileName)
 	{
-		FILE *t = fopen(decodeTableFilename, "rb");
-		fseek(t, 0x0a, SEEK_SET);
-		fread(&(this->DvId), sizeof(std::uint32_t), 1, t);
-		this->DvId = UINT32_SWAP_BE_LE(this->DvId);
-		fclose(t);
+		if (decodeTableFilename) free(decodeTableFilename);
+		decodeTableFilename = strdup(TableFileName);
+		codeType = type;
 	}
+}
+
+bool SonyDb::setDeviceKeyFile(const char *fileName)
+{
+	if (!fileName || !*fileName) return false;
+	FILE *file = fopen(fileName, "rb");
+	if (!file) return false;
+	std::uint8_t bytes[4];
+	const bool valid = fseek(file, 0x0a, SEEK_SET) == 0 &&
+		fread(bytes, 1, sizeof(bytes), file) == sizeof(bytes);
+	fclose(file);
+	if (!valid) return false;
+	DvId = (static_cast<std::uint32_t>(bytes[0]) << 24) |
+		(static_cast<std::uint32_t>(bytes[1]) << 16) |
+		(static_cast<std::uint32_t>(bytes[2]) << 8) | bytes[3];
+	if (decodeTableFilename) free(decodeTableFilename);
+	decodeTableFilename = strdup(fileName);
+	codeType = ENCODING_USE_KEY;
+	return true;
+}
+
+void SonyDb::clearDeviceKey()
+{
+	if (decodeTableFilename) free(decodeTableFilename);
+	decodeTableFilename = 0;
+	DvId = 0;
+	codeType = ENCODING_USE_NONE;
+}
+
+bool SonyDb::isDeviceKeyConfigured() const { return codeType == ENCODING_USE_KEY; }
+bool SonyDb::requiresDeviceKey() const { return deviceKeyRequired; }
+
+std::string SonyDb::findDeviceKeyFile() const
+{
+	if (!driveLetter) return {};
+	static const char *relativePaths[] = {
+		"DvID.dat", "DvID.DAT", "OMGAUDIO/DvID.dat", "OMGAUDIO/DvID.DAT",
+		"omgaudio/DvID.dat", "omgaudio/DvID.DAT", "MP3FM/DvID.dat", "MP3FM/DvID.DAT",
+		"mp3fm/DvID.dat", "mp3fm/DvID.DAT", "JSYMPHONIC/DvID.dat", "JSYMPHONIC/DvID.DAT"
+	};
+	for (const char *relative : relativePaths)
+	{
+		filesystem::path candidate = filesystem::path(driveLetter) / relative;
+		error_code error;
+		if (filesystem::is_regular_file(candidate, error) && !error)
+			return candidate.string();
+	}
+	return {};
+}
+
+int SonyDb::getUnprotectedMp3Count() const
+{
+	int count = 0;
+	for (const Song &song : songs)
+		if (song.statusOfSong == ON_DEVICE && (song.encoding >> 24) == 0x03 &&
+			song.protection == SONY_PROTECTION_NONE)
+			++count;
+	return count;
+}
+
+bool SonyDb::repairUnprotectedMp3Tracks()
+{
+	if (copying || !deviceKeyRequired || codeType != ENCODING_USE_KEY || hasPendingChanges())
+		return false;
+	bool allRepaired = true;
+	bool repairedAny = false;
+	for (Song &song : songs)
+	{
+		if (song.statusOfSong != ON_DEVICE || (song.encoding >> 24) != 0x03 ||
+			song.protection != SONY_PROTECTION_NONE)
+			continue;
+		if (!encrypt_unprotected_oma(song.filename, song.sonyDbOrder, DvId))
+		{
+			allRepaired = false;
+			continue;
+		}
+		song.protection = SONY_PROTECTION_ENCRYPTED_MP3;
+		memset(song.cidRecord, 0, sizeof(song.cidRecord));
+		song.hasCidRecord = true;
+		repairedAny = true;
+	}
+	if (!repairedAny) return allRepaired;
+	databaseDirty = true;
+	return writeTracks() && allRepaired;
 }
 
 
@@ -846,6 +1034,10 @@ bool SonyDb::addOMA(Song *s, int destination)
 	this->copyPercent = 0;
 	if (s->statusOfSong != ADD_TO_DEVICE)
 		return false;
+	s->protection = codeType == ENCODING_USE_NONE ? SONY_PROTECTION_NONE :
+		SONY_PROTECTION_ENCRYPTED_MP3;
+	memset(s->cidRecord, 0, sizeof(s->cidRecord));
+	s->hasCidRecord = true;
 
 	char *filename = GetOMAFilename(destination);
 
@@ -1311,19 +1503,8 @@ bool SonyDb::addOMA(Song *s, int destination)
 	header2[3] = 0x02;
 	header2[4] = 0;   //size of 2nd header
 	header2[5] = 0x60;//size of 2nd header
-	header2[6] = 0xff;// + same value as in 05CIDLST.DAT
-	if (this->codeType == ENCODING_USE_NONE)
-	{
-		header2[7] = 0xff;// cp or sonicstage? or encoded not encoded? 505 =e  1000 =f
-	}
-	else
-	{
-		header2[7] = 0xfe;// cp or sonicstage? or encoded not encoded? 505 =e  1000 =f
-	} 
-	header2[12] = 0x01;
-	header2[13] = 0x0F;
-	header2[14] = 0x50;
-	header2[15] = 0x00;// - same value as in 05CIDLST.DAT
+	header2[6] = static_cast<std::uint8_t>(s->protection >> 8);
+	header2[7] = static_cast<std::uint8_t>(s->protection & 0xff);
 	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
@@ -1334,19 +1515,7 @@ bool SonyDb::addOMA(Song *s, int destination)
 
 	//second line
 	memset(header2, 0, 16);
-	header2[1] = 0x04;// + same value as in 05CIDLST.DAT fixme
-	//zeros...   
-	header2[5] = 0x01; //fixme 01
-	header2[6] = 0x02; //fixme 02
-	header2[7] = 0x03; //fixme 03
-	header2[8] = 0xc8;
-	header2[9] = 0xd8;
-	header2[10] = 0x36;
-	header2[11] = 0xd8;
-	header2[12] = 0x11; //fixme 11
-	header2[13] = 0x22; //fixme 22
-	header2[14] = 0x33; //fixme 33
-	header2[15] = 0x44;// - same value as in 05CIDLST.DAT
+	// These 24 bytes are reserved for LSI DRM. Encrypted MP3 uses zeroes.
 	if (fwrite(header2, sizeof(std::uint8_t), 16, fout) != 16)
 	{
 		fclose(fout);
@@ -1538,13 +1707,23 @@ string SonyDb::exportPathForSong(int order, const char *destination) const
 int SonyDb::exportSong(int order, const char *destination, bool overwrite,
 	string *outputPath)
 {
+	const string path = exportPathForSong(order, destination);
+	if (outputPath)
+		*outputPath = path;
+	if (path.empty())
+		return EXPORT_NOT_FOUND;
+	return exportSongToFile(order, path.c_str(), overwrite);
+}
+
+int SonyDb::exportSongToFile(int order, const char *outputFile, bool overwrite)
+{
+	if (!outputFile || !*outputFile)
+		return EXPORT_FAILED;
 	for (vector<Song>::iterator song = songs.begin(); song != songs.end(); ++song)
 	{
 		if (song->sonyDbOrder != order || song->statusOfSong != ON_DEVICE)
 			continue;
-		const string path = exportPathFor(&(*song), songs, destination);
-		if (outputPath)
-			*outputPath = path;
+		const string path = outputFile;
 		struct stat existing;
 		if (!overwrite && stat(path.c_str(), &existing) == 0)
 			return EXPORT_ALREADY_EXISTS;
@@ -1552,7 +1731,7 @@ int SonyDb::exportSong(int order, const char *destination, bool overwrite,
 		filesystem::create_directories(filesystem::path(path).parent_path(), directoryError);
 		if (directoryError)
 			return EXPORT_FAILED;
-		if (!getOMA(&(*song), const_cast<char *>(destination)))
+		if (!getOMAToFile(&(*song), path.c_str()))
 			return EXPORT_FAILED;
 		return EXPORT_OK;
 	}
@@ -1562,10 +1741,18 @@ int SonyDb::exportSong(int order, const char *destination, bool overwrite,
 //some code is from GYM
 bool SonyDb::getOMA(Song *s, char *destination)
 {
-	if (s->statusOfSong == ADD_TO_DEVICE)
+	if (!s || !destination)
+		return false;
+	const string filename = exportPathFor(s, songs, destination);
+	return getOMAToFile(s, filename.c_str());
+}
+
+bool SonyDb::getOMAToFile(Song *s, const char *outputFile)
+{
+	if (!s || !outputFile || !*outputFile || s->statusOfSong == ADD_TO_DEVICE)
 		return (false);
 
-	const string filename = exportPathFor(s, songs, destination);
+	const string filename = outputFile;
 	const string partialFilename = filename + ".sonydb-part";
 	std::uint8_t	    *header = (std::uint8_t*)malloc(sizeof(std::uint8_t) * 11);
 	char	    *tmpTag = (char*)malloc(sizeof(char) * 256);
@@ -1612,9 +1799,8 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	}
 	const std::uint16_t encryption =
 		(static_cast<std::uint16_t>(omaFormatHeader[6]) << 8) | omaFormatHeader[7];
-	if ((encryption == 0xffff && this->codeType != ENCODING_USE_NONE) ||
-		(encryption == 0xfffe && this->codeType == ENCODING_USE_NONE) ||
-		(encryption != 0xffff && encryption != 0xfffe))
+	if ((encryption == SONY_PROTECTION_ENCRYPTED_MP3 && this->codeType == ENCODING_USE_NONE) ||
+		(encryption != SONY_PROTECTION_NONE && encryption != SONY_PROTECTION_ENCRYPTED_MP3))
 	{
 		fprintf(fp, "error unsupported OMA encryption 0x%04x: %s\n", encryption, s->filename);fflush(fp);
 		fclose(fin);
@@ -1636,11 +1822,11 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	}
 
 	//load decode table for this track
-	if (this->codeType == ENCODING_USE_TABLE)
+	if (encryption == SONY_PROTECTION_ENCRYPTED_MP3 && this->codeType == ENCODING_USE_TABLE)
 		this->loadCodeTable(s->sonyDbOrder - 1);
 
 	//or use key
-	if (this->codeType == ENCODING_USE_KEY)
+	if (encryption == SONY_PROTECTION_ENCRYPTED_MP3 && this->codeType == ENCODING_USE_KEY)
 		key = ( 0x2465 + s->sonyDbOrder * 0x5296E435 ) ^ this->DvId;
 
 	//reserve 10bytes for the header
@@ -1773,11 +1959,11 @@ bool SonyDb::getOMA(Song *s, char *destination)
 	{ 
 		for (int i = 0; i < nbRead; i++)
 		{
-			if (this->codeType == ENCODING_USE_NONE) //just copy without decoding
-				outputData[i] = inputData[i]; 
-			if (this->codeType == ENCODING_USE_TABLE) //decodeKeys.dat
+			if (encryption == SONY_PROTECTION_NONE) //just copy without decoding
+				outputData[i] = inputData[i];
+			if (encryption == SONY_PROTECTION_ENCRYPTED_MP3 && this->codeType == ENCODING_USE_TABLE) //decodeKeys.dat
 				outputData[i] = codeTable[((position % 4) * 256) + inputData[i]];
-			if (this->codeType == ENCODING_USE_KEY) //DvId.dat
+			if (encryption == SONY_PROTECTION_ENCRYPTED_MP3 && this->codeType == ENCODING_USE_KEY) //DvId.dat
 			{
 				if ((position % 4) == 0) outputData[i] = ((inputData[i]) ^ ((key & 0xFF000000) >> 24));
 				if ((position % 4) == 1) outputData[i] = ((inputData[i]) ^ ((key & 0x00FF0000) >> 16));
@@ -1838,6 +2024,14 @@ bool SonyDb::writeTracks()
 	//already copying
 	if (this->copying)
 		return false;
+	// Generation 3 Network Walkman models reject clear MP3 payloads with MG
+	// ERROR. Refuse the operation before deleting or rewriting anything.
+	if (nbTrackToAdd > 0 && deviceKeyRequired && codeType == ENCODING_USE_NONE)
+	{
+		fprintf(fp, "error device-specific DvID key is required for MP3 transfer\n");
+		fflush(fp);
+		return false;
+	}
 
 	//nothing to do
 	//if ((nbTrackToAdd <= 0) && (nbTrackToDel <= 0) && (getNbPlaylist() <= 0))
@@ -1947,6 +2141,10 @@ bool SonyDb::writeTracks()
 					(*j).songlen = 0;
 					(*j).track_nr = 0;
 					(*j).year = 0;
+					(*j).encoding = 0;
+					(*j).protection = SONY_PROTECTION_NONE;
+					memset((*j).cidRecord, 0, sizeof((*j).cidRecord));
+					(*j).hasCidRecord = true;
 					songlist.push_back(&(*j));
 				}
 			}
@@ -2573,6 +2771,7 @@ int SonyDb::readAllTracks()
 		addTrackTotalByte = 0;
 		delTrackTotalByte = 0;
 		databaseDirty = false;
+		deviceKeyRequired = false;
 
 		FILE *f, *f2;
 		Song *s;
@@ -2585,6 +2784,12 @@ int SonyDb::readAllTracks()
 			fprintf(fp, "error can't open file 04CNTINF.DAT\n");fflush(fp);
 			return 0;
 		}
+		// OpenMG generation 3 databases carry this DRM control file even when the
+		// library is empty or a previous application damaged per-track flags.
+		sprintf(tmp, "%s/OMGAUDIO/00010021.DAT", getDriveLetter());
+		struct stat drmControlFile;
+		if (stat(tmp, &drmControlFile) == 0 && S_ISREG(drmControlFile.st_mode))
+			deviceKeyRequired = true;
 		sprintf(tmp, "%s/OMGAUDIO/04CNTINF.DAT", getDriveLetter());
 		f = fopen(tmp, "rb");
 		if (f == NULL)
@@ -2673,6 +2878,13 @@ int SonyDb::readAllTracks()
 				{    
 					//adding additionnal info
 					s->filename = GetOMAFilename(index);
+					const std::uint16_t fileProtection = oma_protection(s->filename);
+					struct stat omaFile;
+					if (stat(s->filename, &omaFile) == 0 && S_ISREG(omaFile.st_mode))
+						s->protection = fileProtection;
+					if (s->protection == SONY_PROTECTION_LSI_DRM ||
+						s->protection == SONY_PROTECTION_ENCRYPTED_MP3)
+						deviceKeyRequired = true;
 					//fprintf(fp, "file number %s\n", s->filename);fflush(fp);
 					if (trackNumberAvailable)
 					{
@@ -2701,6 +2913,29 @@ int SonyDb::readAllTracks()
 		fclose(f);
 		if (trackNumberAvailable)
 			fclose(f2);
+
+		// Keep the complete per-title CIDL record. Existing LSI DRM tracks need
+		// their original bytes; non-LSI tracks and empty slots normally contain zeros.
+		sprintf(tmp, "%s/OMGAUDIO/05CIDLST.DAT", getDriveLetter());
+		FILE *cid = fopen(tmp, "rb");
+		if (cid)
+		{
+			sonyFileHeader cidHeader;
+			sonyObjectPointer cidPointer;
+			sonyObject cidObject;
+			if (getHeader(&cidHeader, cid) && getObjectPointer(&cidPointer, cid) &&
+				getObject(&cidObject, cid) && cidObject.size >= 48)
+			{
+				vector<std::uint8_t> record(cidObject.size);
+				for (size_t index = 0; index < songs.size() && index < cidObject.count; ++index)
+				{
+					if (fread(record.data(), 1, record.size(), cid) != record.size()) break;
+					memcpy(songs[index].cidRecord, record.data(), sizeof(songs[index].cidRecord));
+					songs[index].hasCidRecord = true;
+				}
+			}
+			fclose(cid);
+		}
 
 		while (songs_temporary.size() > 0)
 		{
@@ -2741,6 +2976,7 @@ bool SonyDb::getTrack(FILE *f, Song *output)
 	}   
 
 	output->encoding = t.trackEncoding;
+	output->protection = static_cast<std::uint16_t>((t.fileType[2] << 8) | t.fileType[3]);
 
 
 	//length is in ms
@@ -3971,15 +4207,6 @@ bool SonyDb::write_04CNTINF(vector<Song *> songsToSend)
 
 	t.fileType[0] = 0x00;
 	t.fileType[1] = 0x00;
-	t.fileType[2] = 0xff;
-	if (this->codeType == ENCODING_USE_NONE)
-	{
-		t.fileType[3] = 0xff; //encrypted or not
-	}
-	else
-	{
-		t.fileType[3] = 0xfe; //encrypted or not
-	}
 
 
 	t.nbTagRecords = UINT16_SWAP_BE_LE(5);
@@ -3991,6 +4218,10 @@ bool SonyDb::write_04CNTINF(vector<Song *> songsToSend)
 
 	for (vector<Song *>::iterator i = songsToSend.begin(); i != songsToSend.end(); i++)
 	{
+		std::uint16_t protection = (*i)->protection;
+		if (protection == 0) protection = SONY_PROTECTION_NONE;
+		t.fileType[2] = static_cast<std::uint8_t>(protection >> 8);
+		t.fileType[3] = static_cast<std::uint8_t>(protection & 0xff);
 		t.trackEncoding = UINT32_SWAP_BE_LE((*i)->encoding);
 		t.trackLength = UINT32_SWAP_BE_LE((*i)->songlen * 1000);
 
@@ -4064,43 +4295,11 @@ bool SonyDb::write_05CIDLST(vector<Song *> songsToSend)
 	obj.padding[1] = 0;
 	writeObject(&obj, f);
 
-	std::uint8_t t[16];
-	std::uint8_t tt[32];
-
-	t[0] = 0; //WWWWTTTTFFFFFF??????
-	t[1] = 0;
-	t[2] = 0;
-	t[3] = 0;
-	t[4] = 0x01;
-	t[5] = 0x0F;
-	t[6] = 0x50;
-	t[7] = 0x00;
-	t[8] = 0x00;
-	t[9] = 0x04;
-	t[10] = 0;
-	t[11] = 0;
-	t[12] = 0;
-	t[13] = 0x01; //fixme 01
-	t[14] = 0x02; //fixme 02
-	t[15] = 0x03; //fixme 03
-
-	tt[0] = 0xc8; //value is different in NAW3000?!
-	tt[1] = 0xd8;
-	tt[2] = 0x36;
-	tt[3] = 0xd8;
-
-	for (int i = 4; i < 32; i++)
-		tt[i] = 0;
-
 	for (vector<Song *>::iterator song = songsToSend.begin(); song != songsToSend.end(); song++)
 	{
-		if (fwrite(&t, 16, 1, f) != 1)
-			return (false);
-		tt[4] = 0x11; //fixme 11
-		tt[5] = 0x22; //fixme 22
-		tt[6] = 0x33; //fixme 33 
-		tt[7] = 0x44; //fixme 44
-		if (fwrite(&tt, 32, 1, f) != 1)
+		std::uint8_t emptyRecord[48]{};
+		const std::uint8_t *record = (*song)->hasCidRecord ? (*song)->cidRecord : emptyRecord;
+		if (fwrite(record, sizeof(emptyRecord), 1, f) != 1)
 			return (false);
 	}
 

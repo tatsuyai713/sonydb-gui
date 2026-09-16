@@ -161,6 +161,112 @@ int main()
         destination / "Various Artists" / u8"初恋" / "05 - Second Title.mp3");
     CHECK(database.exportSong(2, destination.c_str(), false) == EXPORT_OK);
 
+    // Generation 3 players encrypt MP3 payloads with their device-specific
+    // DvID. Verify the on-device marker, XOR stream, CIDL semantics, export,
+    // and the fail-closed behavior when the key is unavailable.
+    char protectedTemplate[] = "/tmp/sonydb-protected-test-XXXXXX";
+    char *protectedDirectory = mkdtemp(protectedTemplate);
+    CHECK(protectedDirectory != nullptr);
+    SonyDb protectedDb;
+    CHECK(protectedDb.detectPlayerStorage(protectedDirectory));
+    CHECK(protectedDb.initializePlayer());
+    const std::filesystem::path keyFile = std::filesystem::path(protectedDirectory) / "DvID.dat";
+    const unsigned char keyBytes[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                         0x12, 0x34, 0x56, 0x78};
+    std::ofstream(keyFile, std::ios::binary).write(
+        reinterpret_cast<const char *>(keyBytes), sizeof(keyBytes));
+    CHECK(protectedDb.setDeviceKeyFile(keyFile.c_str()));
+    Song protectedTrack = input;
+    protectedTrack.artist = const_cast<char *>("Protected Artist");
+    protectedTrack.album = const_cast<char *>("Protected Album");
+    protectedTrack.title = const_cast<char *>("Protected Title");
+    protectedTrack.filename = const_cast<char *>(source.c_str());
+    CHECK(protectedDb.addSongCopy(protectedTrack));
+    CHECK(protectedDb.writeTracks());
+
+    const std::filesystem::path protectedOma = std::filesystem::path(protectedDirectory) /
+        "OMGAUDIO" / "10F00" / "10000001.OMA";
+    std::ifstream protectedInput(protectedOma, std::ios::binary);
+    protectedInput.seekg(4096 + 6);
+    unsigned char protectionBytes[2]{};
+    protectedInput.read(reinterpret_cast<char *>(protectionBytes), sizeof(protectionBytes));
+    CHECK(protectionBytes[0] == 0xff && protectionBytes[1] == 0xfe);
+    protectedInput.seekg(4096 + 96);
+    unsigned char encryptedFrame[4]{};
+    protectedInput.read(reinterpret_cast<char *>(encryptedFrame), sizeof(encryptedFrame));
+    const std::uint32_t streamKey = (0x2465U + 0x5296E435U) ^ 0x12345678U;
+    CHECK(encryptedFrame[0] == static_cast<unsigned char>(0xff ^ (streamKey >> 24)));
+    CHECK(encryptedFrame[1] == static_cast<unsigned char>(0xfb ^ ((streamKey >> 16) & 0xff)));
+
+    std::ifstream protectedInfo(std::filesystem::path(protectedDirectory) /
+        "OMGAUDIO" / "04CNTINF.DAT", std::ios::binary);
+    protectedInfo.seekg(48 + 2);
+    protectedInfo.read(reinterpret_cast<char *>(protectionBytes), sizeof(protectionBytes));
+    CHECK(protectionBytes[0] == 0xff && protectionBytes[1] == 0xfe);
+    std::ifstream protectedCid(std::filesystem::path(protectedDirectory) /
+        "OMGAUDIO" / "05CIDLST.DAT", std::ios::binary);
+    protectedCid.seekg(48);
+    char cidBytes[48]{};
+    protectedCid.read(cidBytes, sizeof(cidBytes));
+    for (char byte : cidBytes) CHECK(byte == 0);
+	for (int index = 0; index < 48; ++index) cidBytes[index] = static_cast<char>(index + 1);
+	{
+		std::fstream editableCid(std::filesystem::path(protectedDirectory) /
+			"OMGAUDIO" / "05CIDLST.DAT", std::ios::in | std::ios::out | std::ios::binary);
+		editableCid.seekp(48);
+		editableCid.write(cidBytes, sizeof(cidBytes));
+	}
+	// Simulate a file created by the broken clear-MP3 path, while retaining the
+	// generation-3 control marker used by a real NW-E405.
+	std::ofstream(std::filesystem::path(protectedDirectory) / "OMGAUDIO" / "00010021.DAT",
+		std::ios::binary).put('\0');
+	{
+		std::fstream clearOma(protectedOma, std::ios::in | std::ios::out | std::ios::binary);
+		clearOma.seekp(4096 + 6);
+		const char clearProtection[2] = {static_cast<char>(0xff), static_cast<char>(0xff)};
+		clearOma.write(clearProtection, sizeof(clearProtection));
+		clearOma.seekp(4096 + 96);
+		clearOma.write(mp3.data(), mp3.size());
+	}
+
+    SonyDb protectedReopened;
+    CHECK(protectedReopened.detectPlayer(protectedDirectory));
+    CHECK(protectedReopened.readAllTracks() == 1);
+    CHECK(protectedReopened.requiresDeviceKey());
+	CHECK(protectedReopened.getUnprotectedMp3Count() == 1);
+    const std::filesystem::path blockedSource = std::filesystem::path(protectedDirectory) / "blocked.mp3";
+    std::filesystem::copy_file(source, blockedSource);
+    Song blockedTrack = protectedTrack;
+    blockedTrack.title = const_cast<char *>("Blocked Without Key");
+    blockedTrack.filename = const_cast<char *>(blockedSource.c_str());
+    CHECK(protectedReopened.addSongCopy(blockedTrack));
+    CHECK(!protectedReopened.writeTracks());
+	CHECK(protectedReopened.removeSong(0, blockedSource.c_str()));
+	CHECK(protectedReopened.readAllTracks() == 1);
+    CHECK(protectedReopened.setDeviceKeyFile(keyFile.c_str()));
+	CHECK(protectedReopened.repairUnprotectedMp3Tracks());
+	CHECK(protectedReopened.getUnprotectedMp3Count() == 0);
+	CHECK(protectedReopened.addSongCopy(blockedTrack));
+    CHECK(protectedReopened.writeTracks());
+	std::ifstream rewrittenCid(std::filesystem::path(protectedDirectory) /
+		"OMGAUDIO" / "05CIDLST.DAT", std::ios::binary);
+	rewrittenCid.seekg(48);
+	char preservedCid[48]{};
+	rewrittenCid.read(preservedCid, sizeof(preservedCid));
+	CHECK(std::memcmp(cidBytes, preservedCid, sizeof(cidBytes)) == 0);
+    const std::filesystem::path protectedExport = std::filesystem::path(protectedDirectory) / "export.mp3";
+    CHECK(protectedReopened.exportSongToFile(1, protectedExport.c_str(), false) == EXPORT_OK);
+    std::ifstream protectedRestored(protectedExport, std::ios::binary);
+    unsigned char protectedId3[10]{};
+    protectedRestored.read(reinterpret_cast<char *>(protectedId3), sizeof(protectedId3));
+    const std::uint32_t protectedTagSize =
+        ((protectedId3[6] & 0x7f) << 21) | ((protectedId3[7] & 0x7f) << 14) |
+        ((protectedId3[8] & 0x7f) << 7) | (protectedId3[9] & 0x7f);
+    protectedRestored.seekg(10 + protectedTagSize);
+    protectedRestored.read(reinterpret_cast<char *>(frameHeader), sizeof(frameHeader));
+    CHECK(frameHeader[0] == 0xff && frameHeader[1] == 0xfb);
+    std::filesystem::remove_all(protectedDirectory);
+
     SonyDb invalidDatabase;
     CHECK(invalidDatabase.detectPlayerStorage(directory));
     const std::filesystem::path invalidSource = std::filesystem::path(directory) / "invalid.mp3";

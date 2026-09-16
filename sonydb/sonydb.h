@@ -76,6 +76,10 @@ char *utf16_to_ansi(const utf16char *str, long len, bool endian);
 #define ENCODING_USE_TABLE	      1
 #define ENCODING_USE_KEY	      2
 
+#define SONY_PROTECTION_LSI_DRM       0x0001
+#define SONY_PROTECTION_ENCRYPTED_MP3 0xfffe
+#define SONY_PROTECTION_NONE          0xffff
+
 #define EXPORT_OK                 0
 #define EXPORT_NOT_FOUND          1
 #define EXPORT_ALREADY_EXISTS     2
@@ -103,6 +107,13 @@ typedef struct {
      int       statusOfSong; //0 was present on player, 1 was not present on player needs & to be added, 2 was present & needs to be removed
      // Four-byte OMGAUDIO codec field: codec, flags, MPEG parameters, mode.
      std::uint32_t    encoding;
+     // Per-track OpenMG protection. This must not be replaced globally when
+     // rewriting 04CNTINF because existing ATRAC tracks may use LSI DRM.
+     std::uint16_t    protection;
+     // 05CIDLST contains a track-specific 48-byte record for LSI DRM titles.
+     // Non-LSI titles, including encrypted MP3, use an all-zero record.
+     std::uint8_t     cidRecord[48];
+     bool             hasCidRecord;
 } Song;
 
 typedef struct {
@@ -197,6 +208,7 @@ class SonyDb
      int  getTrackNumber(char *filename); //read the track number directly from the omg header
      std::uint32_t DvId;
      int  codeType; //0 no code, 1 decodeKeys.dat, 2 DvId.dat
+     bool deviceKeyRequired;
 
      /* copy progress */
      bool copying; //currently getting or adding Oma files, or rewriting db
@@ -274,13 +286,22 @@ class SonyDb
      bool updateSong(int order, const char *filename, const Song &values);
      bool hasPendingChanges() const;
      bool getOMA(Song *s, char *destination);//download oma to mp3
+     bool getOMAToFile(Song *s, const char *outputFile);
      std::string exportPathForSong(int order, const char *destination) const;
      int exportSong(int order, const char *destination, bool overwrite,
                     std::string *outputPath = 0);
+     int exportSongToFile(int order, const char *outputFile, bool overwrite);
 
      
      /*encode decoder*/
      void setTable(char *decodeTableFileName, int type);
+     bool setDeviceKeyFile(const char *fileName);
+     void clearDeviceKey();
+     bool isDeviceKeyConfigured() const;
+     bool requiresDeviceKey() const;
+     std::string findDeviceKeyFile() const;
+     int getUnprotectedMp3Count() const;
+     bool repairUnprotectedMp3Tracks();
 
      /* misc */
      bool isPresent();
