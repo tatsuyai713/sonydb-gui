@@ -17,7 +17,9 @@
 #include <set>
 #include <system_error>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #endif
 #include "sonydb.h"
@@ -1002,6 +1004,24 @@ static std::string block_device_for_mount(const char *mountPoint)
 		break;
 	}
 	endmntent(mounts);
+	// A mounted filesystem normally resolves to a partition such as /dev/sdd1,
+	// but Linux only accepts this vendor SG_IO command on the whole disk. Use
+	// sysfs instead of trimming digits so names such as nvme0n1p1 stay correct.
+	struct stat deviceInfo{};
+	if (!result.empty() && stat(result.c_str(), &deviceInfo) == 0 && S_ISBLK(deviceInfo.st_mode))
+	{
+		const std::filesystem::path sysDevice = std::filesystem::path("/sys/dev/block") /
+			(std::to_string(major(deviceInfo.st_rdev)) + ":" +
+			 std::to_string(minor(deviceInfo.st_rdev)));
+		error.clear();
+		const std::filesystem::path resolvedSysDevice =
+			std::filesystem::canonical(sysDevice, error);
+		if (!error && std::filesystem::exists(resolvedSysDevice / "partition"))
+		{
+			const std::string parentName = resolvedSysDevice.parent_path().filename().string();
+			if (!parentName.empty()) result = (std::filesystem::path("/dev") / parentName).string();
+		}
+	}
 	return result;
 }
 #endif
