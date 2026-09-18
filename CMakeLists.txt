@@ -59,6 +59,8 @@ if(SONYDB_BUILD_GUI)
   install(FILES logo.png
           DESTINATION share/icons/hicolor/512x512/apps
           RENAME sonydb-gui.png)
+  install(FILES 70-sonydb-walkman.rules
+          DESTINATION lib/udev/rules.d)
 endif()
 
 # Native Debian/Ubuntu package metadata. CPack asks dpkg-shlibdeps to derive

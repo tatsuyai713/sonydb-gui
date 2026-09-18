@@ -194,11 +194,22 @@ searches common device and MP3 File Manager locations for the key, preserves
 existing protection records, and blocks a protected transfer before changing
 the device when no valid key is available.
 
+If `DvID.dat` is absent on Linux,
+SonyDb asks the connected player for its device-ID record through the same
+non-destructive vendor SCSI query used by Sony MP3 File Manager, validates the
+16-byte response, and stores it as `MP3FM/DvID.dat`.
+
 If an older SonyDb build created unprotected tracks that report **MG ERROR**,
 load the correct key under **Settings > Walkman Security** and use **Repair
 Existing MG ERROR Tracks**. A database backup is created before repair.
-`DvID.dat` is device-specific and must not be invented or copied from another
-player.
+
+`DvID.dat` is unique to the physical Walkman and cannot safely be invented or
+copied from another unit. For a supported connected player such as the NW-E405,
+SonyDb retrieves it directly from the hardware. Manual selection in
+**Settings > Walkman Security** remains available when the raw device cannot be
+opened or a player does not implement this query. Files transferred by an older
+SonyDb build that already show **MG ERROR** were written without this encryption
+and must be removed and transferred again after the correct key is loaded.
 
 ## Format limitations
 

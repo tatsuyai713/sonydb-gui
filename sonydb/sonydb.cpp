@@ -13,9 +13,12 @@
 #include <glob.h>
 #include <mntent.h>
 #include <limits.h>
+#include <scsi/sg.h>
 #include <set>
 #include <system_error>
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 #endif
 #include "sonydb.h"
 
@@ -957,6 +960,113 @@ std::string SonyDb::findDeviceKeyFile() const
 			return candidate.string();
 	}
 	return {};
+}
+
+#ifndef _WIN32
+static bool run_scsi_command(int device, std::uint8_t *command, unsigned commandLength,
+	void *data, unsigned dataLength, int direction)
+{
+	std::uint8_t sense[64]{};
+	sg_io_hdr_t request{};
+	request.interface_id = 'S';
+	request.dxfer_direction = direction;
+	request.cmd_len = static_cast<unsigned char>(commandLength);
+	request.mx_sb_len = sizeof(sense);
+	request.dxfer_len = dataLength;
+	request.dxferp = data;
+	request.cmdp = command;
+	request.sbp = sense;
+	request.timeout = 5000;
+	return ioctl(device, SG_IO, &request) == 0 && request.status == 0 &&
+		request.host_status == 0 && request.driver_status == 0 && request.resid == 0;
+}
+
+static std::string block_device_for_mount(const char *mountPoint)
+{
+	if (!mountPoint || !*mountPoint) return {};
+	std::error_code error;
+	const std::filesystem::path wanted = std::filesystem::weakly_canonical(mountPoint, error);
+	if (error) return {};
+	FILE *mounts = setmntent("/proc/self/mounts", "r");
+	if (!mounts) return {};
+	std::string result;
+	struct mntent *entry;
+	while ((entry = getmntent(mounts)) != NULL)
+	{
+		error.clear();
+		const std::filesystem::path mounted = std::filesystem::weakly_canonical(entry->mnt_dir, error);
+		if (error || mounted != wanted) continue;
+		char resolved[PATH_MAX];
+		if (realpath(entry->mnt_fsname, resolved) && strncmp(resolved, "/dev/", 5) == 0)
+			result = resolved;
+		break;
+	}
+	endmntent(mounts);
+	return result;
+}
+#endif
+
+bool SonyDb::provisionDeviceKeyFromPlayer()
+{
+	const std::string existing = findDeviceKeyFile();
+	if (!existing.empty()) return setDeviceKeyFile(existing.c_str());
+#ifdef _WIN32
+	return false;
+#else
+	if (!driveLetter || !deviceKeyRequired) return false;
+	const std::string blockDevice = block_device_for_mount(driveLetter);
+	if (blockDevice.empty()) return false;
+	const int device = open(blockDevice.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
+	if (device < 0) return false;
+
+	// Captured from Sony MP3 File Manager talking to an NW-E405. The first
+	// command selects the 18-byte device-ID record; the second reads it. Both
+	// commands are non-destructive and carry no media payload.
+	std::uint8_t selectCommand[12] = {
+		0xa3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbc, 0x00, 0x14, 0x30, 0x00
+	};
+	std::uint8_t selectData[20] = {0x00, 0x12};
+	std::uint8_t readCommand[12] = {
+		0xa4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbc, 0x00, 0x12, 0x3f, 0x00
+	};
+	std::uint8_t response[18]{};
+	const bool queried = run_scsi_command(device, selectCommand, sizeof(selectCommand),
+		selectData, sizeof(selectData), SG_DXFER_TO_DEV) &&
+		run_scsi_command(device, readCommand, sizeof(readCommand), response,
+			sizeof(response), SG_DXFER_FROM_DEV);
+	close(device);
+	if (!queried || response[0] != 0x00 || response[1] != 0x10)
+		return false;
+	bool nonzero = false;
+	for (std::size_t index = 2; index < sizeof(response); ++index)
+		nonzero = nonzero || response[index] != 0;
+	if (!nonzero) return false;
+
+	std::error_code error;
+	const std::filesystem::path directory = std::filesystem::path(driveLetter) / "MP3FM";
+	std::filesystem::create_directories(directory, error);
+	if (error) return false;
+	const std::filesystem::path destination = directory / "DvID.dat";
+	const std::filesystem::path temporary = directory / ".DvID.dat.sonydb-tmp";
+	FILE *output = fopen(temporary.c_str(), "wb");
+	if (!output) return false;
+	bool written = fwrite(response + 2, 1, 16, output) == 16;
+	written = fflush(output) == 0 && written;
+	written = fsync(fileno(output)) == 0 && written;
+	written = fclose(output) == 0 && written;
+	if (!written)
+	{
+		remove(temporary.c_str());
+		return false;
+	}
+	std::filesystem::rename(temporary, destination, error);
+	if (error)
+	{
+		remove(temporary.c_str());
+		return false;
+	}
+	return setDeviceKeyFile(destination.c_str());
+#endif
 }
 
 int SonyDb::getUnprotectedMp3Count() const

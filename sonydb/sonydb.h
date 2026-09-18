@@ -300,6 +300,7 @@ class SonyDb
      bool isDeviceKeyConfigured() const;
      bool requiresDeviceKey() const;
      std::string findDeviceKeyFile() const;
+     bool provisionDeviceKeyFromPlayer();
      int getUnprotectedMp3Count() const;
      bool repairUnprotectedMp3Tracks();
 

@@ -1040,6 +1040,8 @@ QProgressBar { border: 0; background: #dfe5ef; } QProgressBar::chunk { backgroun
 		db_.clearDeviceKey();
 		if (!db_.requiresDeviceKey()) { deviceKeyMissing_ = false; return; }
 		QString keyPath = QString::fromStdString(db_.findDeviceKeyFile());
+		if (keyPath.isEmpty() && db_.provisionDeviceKeyFromPlayer())
+			keyPath = QString::fromStdString(db_.findDeviceKeyFile());
 		if (keyPath.isEmpty()) keyPath = QSettings().value(QStringLiteral("walkman/dvidPath")).toString();
 		const QByteArray nativePath = QFile::encodeName(keyPath);
 		if (!keyPath.isEmpty() && db_.setDeviceKeyFile(nativePath.constData())) {
